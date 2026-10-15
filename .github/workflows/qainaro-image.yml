@@ -3,9 +3,6 @@ name: Qainaro CubeAPI Image
 on:
   pull_request:
     branches: [main]
-    paths:
-      - CubeAPI/**
-      - .github/workflows/qainaro-image.yml
   push:
     branches: [main]
     paths:
