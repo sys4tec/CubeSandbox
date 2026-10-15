@@ -1,0 +1,142 @@
+name: Qainaro CubeAPI Image
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - CubeAPI/**
+      - .github/workflows/qainaro-image.yml
+  push:
+    branches: [main]
+    paths:
+      - CubeAPI/**
+      - .github/workflows/qainaro-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qainaro-cubeapi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: CubeAPI build and static validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check workflow syntax
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            rhysd/actionlint:1.7.7 -color .github/workflows/qainaro-image.yml
+
+      - name: Check Rust formatting
+        run: |
+          rustup toolchain install 1.85 --profile minimal --component rustfmt
+          rustfmt +1.85 --edition 2021 --check CubeAPI/src/routes.rs CubeAPI/src/openapi.rs
+
+      - name: Build upstream CubeAPI release image
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg "CUBE_VERSION=e2b-v2-${SOURCE_SHA}" \
+            --build-arg "CUBE_COMMIT=${SOURCE_SHA}" \
+            --build-arg "CUBE_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag cube-api:validation --file CubeAPI/Dockerfile CubeAPI
+
+      - name: Inspect generated OpenAPI operation IDs
+        run: |
+          docker run --rm --entrypoint sh cube-api:validation -c \
+            'cube-api --export-openapi /tmp/openapi.yaml >/dev/null && cat /tmp/openapi.yaml' \
+            > openapi.yaml
+          python3 - <<'PY'
+          import collections
+          import pathlib
+          import re
+          document = pathlib.Path("openapi.yaml").read_text()
+          operation_ids = re.findall(r"^\s+operationId: ([^\n]+)$", document, re.MULTILINE)
+          duplicates = [name for name, count in collections.Counter(operation_ids).items() if count > 1]
+          if duplicates:
+              raise SystemExit(f"Duplicate OpenAPI operation IDs: {duplicates}")
+          required = {"create_sandbox_v2", "connect_sandbox_v2"}
+          if not required.issubset(operation_ids):
+              raise SystemExit("Missing E2B v2 compatibility operation IDs")
+          print(f"Validated {len(operation_ids)} unique OpenAPI operation IDs, including both E2B aliases")
+          PY
+
+  publish:
+    name: Publish immutable CubeAPI image
+    needs: validate
+    if: github.repository == 'sys4tec/CubeSandbox' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE: cr.yandex/${{ vars.YC_REGISTRY_ID }}/cubesandbox/cube-api
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Require publisher configuration
+        env:
+          YC_CI_SA_ID: ${{ vars.YC_CI_SA_ID }}
+          YC_REGISTRY_ID: ${{ vars.YC_REGISTRY_ID }}
+        run: |
+          test -n "$YC_CI_SA_ID"
+          test -n "$YC_REGISTRY_ID"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build upstream image
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          docker buildx build --platform linux/amd64 --load \
+            --build-arg "CUBE_VERSION=e2b-v2-${SOURCE_SHA}" \
+            --build-arg "CUBE_COMMIT=${SOURCE_SHA}" \
+            --build-arg "CUBE_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/sys4tec/CubeSandbox" \
+            --tag "${IMAGE}:sha-${SOURCE_SHA}" --file CubeAPI/Dockerfile CubeAPI
+
+      # Acquire short-lived credentials only after the potentially long build.
+      - name: Exchange GitHub OIDC for Yandex IAM token
+        id: yc
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed@sha256:2b3c67b6c67137d1fd1a4a23b076c5d608c0356fcfd708295df7291baa3034c9
+        with:
+          yc-sa-id: ${{ vars.YC_CI_SA_ID }}
+
+      - name: Authenticate to Yandex Container Registry
+        env:
+          YC_TOKEN: ${{ steps.yc.outputs.token }}
+        run: printf '%s' "$YC_TOKEN" | docker login --username iam --password-stdin cr.yandex
+
+      - name: Push and resolve immutable image
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          image_tag="${IMAGE}:sha-${SOURCE_SHA}"
+          docker push "$image_tag"
+          digest=$(docker buildx imagetools inspect "$image_tag" --format '{{json .Manifest}}' | jq -er '.digest')
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools inspect "${IMAGE}@${digest}"
+          jq -n --arg image "${IMAGE}@${digest}" --arg tag "$image_tag" \
+            --arg commit "$SOURCE_SHA" --arg platform linux/amd64 \
+            '{image: $image, tag: $tag, commit: $commit, platform: $platform}' > image-digests.json
+          printf 'CubeAPI immutable reference: `%s@%s`\n' "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cubeapi-image-digests-${{ github.sha }}
+          path: image-digests.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove local registry authentication
+        if: always()
+        run: docker logout cr.yandex

@@ -45,6 +45,39 @@ impl Modify for SecurityAddon {
     }
 }
 
+struct E2BV2CompatibilityAddon;
+
+impl Modify for E2BV2CompatibilityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let create = openapi
+            .paths
+            .paths
+            .get("/sandboxes")
+            .and_then(|item| item.post.clone());
+        if let Some(mut operation) = create {
+            operation.operation_id = Some("create_sandbox_v2".to_string());
+            if let Some(item) = openapi.paths.paths.get_mut("/v2/sandboxes") {
+                item.post = Some(operation);
+            }
+        }
+
+        let connect = openapi
+            .paths
+            .paths
+            .get("/sandboxes/{sandboxID}/connect")
+            .cloned();
+        if let Some(mut item) = connect {
+            if let Some(operation) = item.post.as_mut() {
+                operation.operation_id = Some("connect_sandbox_v2".to_string());
+            }
+            openapi
+                .paths
+                .paths
+                .insert("/v2/sandboxes/{sandboxID}/connect".to_string(), item);
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -127,7 +160,7 @@ impl Modify for SecurityAddon {
         Volume,
         VolumeAndToken
     )),
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &E2BV2CompatibilityAddon),
     tags(
         (name = "health", description = "Health and liveness"),
         (name = "templates", description = "Template catalog"),
@@ -175,5 +208,13 @@ mod tests {
         assert!(one_of.iter().any(|schema| {
             schema["type"] == "object" && schema["additionalProperties"]["type"] == "array"
         }));
+    }
+
+    #[test]
+    fn documents_e2b_v2_create_and_connect_operations() {
+        let document = serde_json::to_value(build_openapi()).expect("serialize OpenAPI document");
+
+        assert!(document["paths"]["/v2/sandboxes"]["post"].is_object());
+        assert!(document["paths"]["/v2/sandboxes/{sandboxID}/connect"]["post"].is_object());
     }
 }
