@@ -88,6 +88,7 @@ fn build_sandbox_routes(state: &AppState, auth_configured: bool) -> Router<AppSt
         .route("/sandboxes", get(sandboxes::list_sandboxes))
         .route("/sandboxes", post(sandboxes::create_sandbox))
         .route("/v2/sandboxes", get(sandboxes::list_sandboxes_v2))
+        .route("/v2/sandboxes", post(sandboxes::create_sandbox))
         .route("/sandboxes/:sandboxID", get(sandboxes::get_sandbox))
         .route("/sandboxes/:sandboxID", delete(sandboxes::kill_sandbox))
         .route(
@@ -129,6 +130,10 @@ fn build_e2b_pause_resume_router(state: &AppState, auth_configured: bool) -> Rou
         )
         .route(
             "/sandboxes/:sandboxID/connect",
+            post(sandboxes::connect_sandbox),
+        )
+        .route(
+            "/v2/sandboxes/:sandboxID/connect",
             post(sandboxes::connect_sandbox),
         );
 
@@ -356,6 +361,30 @@ mod tests {
             server.get("/templates").await.status_code(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn post_v2_sandboxes_is_routed_to_create_handler() {
+        let server = test_server().await;
+
+        let response = server
+            .post("/v2/sandboxes")
+            .json(&serde_json::json!({}))
+            .await;
+
+        assert_ne!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn post_v2_connect_is_routed_to_connect_handler() {
+        let server = test_server().await;
+
+        let response = server
+            .post("/v2/sandboxes/sb-route-probe/connect")
+            .json(&serde_json::json!({ "timeout": "not-an-integer" }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
