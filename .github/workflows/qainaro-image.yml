@@ -124,6 +124,8 @@ jobs:
           digest=$(docker buildx imagetools inspect "$image_tag" --format '{{json .Manifest}}' | jq -er '.digest')
           [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           docker buildx imagetools inspect "${IMAGE}@${digest}"
+          # jq variables intentionally remain literal for jq to expand.
+          # shellcheck disable=SC2016
           jq -n --arg image "${IMAGE}@${digest}" --arg tag "$image_tag" \
             --arg commit "$SOURCE_SHA" --arg platform linux/amd64 \
             '{image: $image, tag: $tag, commit: $commit, platform: $platform}' > image-digests.json
