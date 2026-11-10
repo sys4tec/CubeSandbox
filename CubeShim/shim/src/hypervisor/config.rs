@@ -17,8 +17,9 @@ use crate::sandbox::pmem::{Pmem, HYP_AGENT_ID, HYP_OS_IMAGE_ID};
 
 use cube_hypervisor::config::{RateLimiterConfig, TokenBucketConfig};
 use cube_hypervisor::vm_config::{
-    ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig, IvshmemConfig, MacAddr,
-    NetConfig, PayloadConfig, PmemConfig, RngConfig, VmConfig as VC, VsockConfig,
+    BalloonConfig, ConsoleConfig, ConsoleOutputMode, CpuTopology, DiskConfig, FsConfig,
+    IvshmemConfig, MacAddr, NetConfig, PayloadConfig, PmemConfig, RngConfig, VmConfig as VC,
+    VsockConfig,
 };
 use cube_hypervisor::vmm_config::VmmConfig;
 
@@ -102,9 +103,10 @@ impl VmConfig {
         #[cfg(target_arch = "x86_64")]
         params.extend(["no_timer_check".to_string(), "noreplace-smp".to_string()]);
         params.extend(["printk.devkmsg=on".to_string()]);
-        #[cfg(target_arch = "aarch64")]
-        params.push("console=ttyAMA0,115200".to_string());
-        #[cfg(not(target_arch = "aarch64"))]
+        // virtio-console on every architecture: output is batched through a
+        // virtqueue and drained off the vCPU thread, while a UART console traps
+        // every byte. On aarch64 the VMM still appends a PL011 earlycon for
+        // boot messages printed before hvc0 registers.
         params.push("console=hvc0".to_string());
         params.extend([
             "net.ifnames=0".to_string(),
@@ -169,6 +171,11 @@ impl VmConfig {
 
         vc.memory.size = self.memory_size * MI_B;
         vc.memory.dirty_log = self.dirty_log;
+        vc.balloon = Some(BalloonConfig {
+            size: 0,
+            deflate_on_oom: false,
+            free_page_reporting: true,
+        });
 
         let cmds = self.cmdlines.join(" ").to_string();
         let payload = PayloadConfig {
@@ -486,6 +493,7 @@ mod tests {
     #[test]
     fn utils_config_dft() {
         let config = VmConfig::default();
+        let hypervisor_config = config.to_vm_config();
 
         //default: pmem0=OS, pmem1=agent
         assert!(config.pmems.is_some());
@@ -499,6 +507,10 @@ mod tests {
         assert!(pmem[1].discard_writes);
         assert_eq!(config.console.mode, ConsoleOutputMode::Tty);
         assert_eq!(config.rng.src, PathBuf::from("/dev/urandom"));
+        let balloon = hypervisor_config.balloon.unwrap();
+        assert_eq!(balloon.size, 0);
+        assert!(!balloon.deflate_on_oom);
+        assert!(balloon.free_page_reporting);
 
         let mut params = vec![
             "root=/dev/pmem0".to_string(),
@@ -509,9 +521,6 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         params.extend(["no_timer_check".to_string(), "noreplace-smp".to_string()]);
         params.extend(["printk.devkmsg=on".to_string()]);
-        #[cfg(target_arch = "aarch64")]
-        params.push("console=ttyAMA0,115200".to_string());
-        #[cfg(not(target_arch = "aarch64"))]
         params.push("console=hvc0".to_string());
         params.extend([
             "net.ifnames=0".to_string(),
@@ -524,6 +533,19 @@ mod tests {
             "mitigations=off".to_string(),
         ]);
         assert_eq!(config.cmdlines, params);
+    }
+
+    #[test]
+    fn guest_console_is_virtio_console() {
+        let config = VmConfig::default();
+        let consoles: Vec<&String> = config
+            .cmdlines
+            .iter()
+            .filter(|p| p.starts_with("console="))
+            .collect();
+        // A trailing UART console= would become /dev/console and route the
+        // agent's stdout through a byte-per-exit device again.
+        assert_eq!(consoles, vec!["console=hvc0"]);
     }
 
     #[test]

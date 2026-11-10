@@ -4,7 +4,7 @@
 // Package rpc implements a ControllerPlugin that calls an external gRPC server.
 //
 // The server must implement VolumeControllerService from
-// Cubelet/api/services/volumeplugin/v1/volumeplugin.proto.
+// pkgs/proto/services/volumeplugin/v1/volumeplugin.proto.
 //
 // Connection target (socket_path config):
 //   - Unix socket: "unix:///run/cube/volume-<name>.sock" or "/run/cube/…"
@@ -16,8 +16,8 @@ import (
 	"fmt"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/volume/plugin"
-	vpb "github.com/tencentcloud/CubeSandbox/Cubelet/api/services/volumeplugin/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/volume/grpctarget"
+	vpb "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/volumeplugin/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/volumeplugin/grpctarget"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -58,11 +58,12 @@ func New(name, socketPath string) (*Plugin, error) {
 
 func (p *Plugin) Name() string { return p.name }
 
-// Create calls the remote Create RPC.
-func (p *Plugin) Create(ctx context.Context, volumeID, name string) (*plugin.VolumeInfo, error) {
+// Create forwards the caller's opaque private data to the remote Create RPC.
+func (p *Plugin) Create(ctx context.Context, volumeID, name, privateData string) (*plugin.VolumeInfo, error) {
 	resp, err := p.client.Create(ctx, &vpb.CreateRequest{
-		VolumeId: volumeID,
-		Name:     name,
+		VolumeId:    volumeID,
+		Name:        name,
+		PrivateData: privateData,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rpc volume plugin %q create: %w", p.name, err)
@@ -76,10 +77,11 @@ func (p *Plugin) Create(ctx context.Context, volumeID, name string) (*plugin.Vol
 	}, nil
 }
 
-// Destroy calls the remote Destroy RPC.
-func (p *Plugin) Destroy(ctx context.Context, volumeID string) error {
+// Destroy forwards the plugin-returned state to the remote Destroy RPC.
+func (p *Plugin) Destroy(ctx context.Context, volumeID, privateData string) error {
 	_, err := p.client.Destroy(ctx, &vpb.DestroyRequest{
-		VolumeId: volumeID,
+		VolumeId:    volumeID,
+		PrivateData: privateData,
 	})
 	if err != nil {
 		return fmt.Errorf("rpc volume plugin %q destroy: %w", p.name, err)

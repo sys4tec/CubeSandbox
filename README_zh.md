@@ -55,6 +55,19 @@ Cube Sandbox 是一款基于 RustVMM 与 KVM 构建的高性能、开箱即用�
 <table>
   <tr>
     <td align="right" valign="top" width="100">
+      <a href="./docs/zh/changelog/v0.7.0.md">
+        <img src="https://img.shields.io/badge/v0.7.0-2026.08.28-20c997?style=flat-square" alt="v0.7.0" />
+      </a>
+    </td>
+    <td valign="top">
+      <strong>v0.7：跨节点暂停恢复、控制面与运维分离、沙箱网络提速</strong><br/>
+      <b>跨节点暂停恢复</b> — 配合 S3 后端，沙箱支持跨节点暂停/恢复，并可从快照创建沙箱（preview）<br/>
+      <b>控制面与运维分离</b> — 节点管理能力拆分至 CubeOps，支持多副本部署，新增 cubeopscli 运维工具<br/>
+      <a href="./docs/zh/changelog/v0.7.0.md">更新日志 →</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="right" valign="top" width="100">
       <a href="./docs/zh/changelog/v0.6.0.md">
         <img src="https://img.shields.io/badge/v0.6.0-2026.07.24-fd7e14?style=flat-square" alt="v0.6.0" />
       </a>
@@ -380,6 +393,7 @@ http://<控制节点 IP>:12088
 | **Cubelet** | 计算节点本地调度组件，管理单节点所有沙箱实例的完整生命周期。 |
 | **CubeVS** | 基于 eBPF 内核态转发的虚拟交换机，提供网络隔离与安全策略支持。 |
 | **CubeEgress** | 基于 OpenResty 的出站安全网关：L7 域名过滤、凭证注入、访问审计；与 CubeVS 内核策略配合，沙箱流量不可绕过。 |
+| **[CubeObservability](./docs/zh/guide/observability.md)** | 沙箱可观测性组件：采集 Cubelet 沙箱 CPU/内存/实例指标与标准输出/标准错误日志，支持 Prometheus、Loki/Elasticsearch 和 Grafana。 |
 | **CubeHypervisor & CubeShim** | 虚拟化层 —— CubeHypervisor 负责管理 KVM MicroVM，CubeShim 实现 containerd Shim v2 接口，将沙箱集成到容器运行时。 |
 
 详见[架构概览](./docs/zh/architecture/overview.md)和 [CubeVS 网络模型](./docs/zh/architecture/network.md)。
@@ -413,27 +427,13 @@ http://<控制节点 IP>:12088
 
 | 特性 | 说明 |
 |---|---|
+| **跨机暂停/恢复性能提升** | 降低暂停/恢复时延、加快快照传输，使跨节点恢复接近本节点恢复速度 |
 | **E2B API 对齐补齐** | 补齐与 E2B 规范的剩余差距，实现完整的兼容替代 |
-| **控制面与数据面分离** | 解耦控制面与数据面，控制面升级或故障不影响已在运行的沙箱，保证全路径高可用 |
 | **沙箱异常恢复** | 自动检测并恢复 VM Crash、shim 卡死、网络分区等异常，支持可配置恢复策略 |
 | **调度与运维能力增强** | 资源感知调度、亲和规则、在线均衡与带迁移的节点排空 |
-
-## 赞助商
-
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://cloud.tencent.com/">
-        <img src="./docs/assets/tcloud_logo_zh.png" alt="腾讯云" height="40">
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://www.arm.com/">
-        <img src="./docs/assets/arm-logo.svg" alt="Arm" height="40">
-      </a>
-    </td>
-  </tr>
-</table>
+| **基于 S3 的性能与成本优化** | 增量上传、更好的缓存与更低成本存储层级，让 S3 快照/Volume I/O 更快、更便宜 |
+| **只带文件系统的快照** | 只保存可写文件系统、跳过内存 dump，适合磁盘冷启动场景，克隆/恢复更快更省 |
+| **GPU 沙箱** | 把宿主机 GPU 透传到沙箱，Agent / 推理可在隔离 VM 内使用 CUDA，调度感知 GPU 库存 |
 
 ## 贡献者
 

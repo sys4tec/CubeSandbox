@@ -126,6 +126,14 @@ enum s3_journal_op {
 	S3_JOURNAL_OP_CHECKPOINT   = 3,
 };
 
+/* Highest op this build understands. The version gate compares it across
+ * versions: an op a reader does not know is indistinguishable from a torn
+ * tail, and replay stops there by design -- so a log written by a newer
+ * build would be silently truncated rather than rejected. The gate is the
+ * mitigation; replay still stops on an unknown op, which is exactly right for
+ * a torn tail. */
+#define S3_JOURNAL_OP_MAX S3_JOURNAL_OP_CHECKPOINT
+
 /* A single journal record. Fixed at 64 bytes so a sequential scan never has to
  * parse a length first.
  *
@@ -279,14 +287,5 @@ uint64_t s3_journal_get_used_bytes(struct s3_journal *journal);
  * with -ENOSPC because there is no snapshot to fall back on.
  */
 uint64_t s3_journal_get_capacity_bytes(struct s3_journal *journal);
-
-/**
- * The LSN the next record will use.
- *
- * Note that LSNs are assigned when a record is *queued*, so this includes
- * records that are submitted but whose callbacks have not fired yet. It answers
- * "what will the next record get", not "how far has durability reached".
- */
-uint64_t s3_journal_get_next_lsn(struct s3_journal *journal);
 
 #endif /* S3LVOL_JOURNAL_H */

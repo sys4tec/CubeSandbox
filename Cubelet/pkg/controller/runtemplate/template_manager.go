@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,7 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/cube/multimeta"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 const (
@@ -32,10 +33,14 @@ const (
 	runTemplateConfigFile  = "config.json"
 )
 
+// Recovery lookups are replaceable so tests can verify backend isolation
+// without accessing host mounts.
+var recoverySnapshotKindRoot = storage.SnapshotKindRoot
+
 type RunTemplateManager interface {
 	SetInstanceType(instanceType string)
 
-	EnsureCubeRunTemplate(ctx context.Context, templateID string) (*templatetypes.LocalRunTemplate, error)
+	EnsureCubeRunTemplate(ctx context.Context, templateID, backend string) (*templatetypes.LocalRunTemplate, error)
 
 	ListLocalTemplates(context.Context) (map[string]*templatetypes.LocalRunTemplate, error)
 }
@@ -91,6 +96,11 @@ func (h *localCubeRunTemplateManager) ListLocalTemplates(ctx context.Context) (m
 		log.G(ctx).WithFields(CubeLog.Fields{
 			"err": err.Error(),
 		}).Warn("failed to recover local templates from xfs snapshot root")
+	}
+	if err := h.recoverBackendMetadataHomes(ctx, cow.BackendJFS, "cubebox", ""); err != nil {
+		log.G(ctx).WithFields(CubeLog.Fields{
+			"err": err.Error(),
+		}).Warn("failed to recover local templates from jfs snapshot root")
 	}
 	if err := h.recoverS3LocalTemplates(ctx, ""); err != nil {
 		log.G(ctx).WithFields(CubeLog.Fields{
@@ -182,7 +192,7 @@ func (h *localCubeRunTemplateManager) removeMissingLocalTemplates(ctx context.Co
 	return nil
 }
 
-func (h *localCubeRunTemplateManager) EnsureCubeRunTemplate(ctx context.Context, templateID string) (*templatetypes.LocalRunTemplate, error) {
+func (h *localCubeRunTemplateManager) EnsureCubeRunTemplate(ctx context.Context, templateID, backend string) (*templatetypes.LocalRunTemplate, error) {
 	h.lock.Lock()
 	delete(h.unusedTemplateMap, templateID)
 	h.lock.Unlock()
@@ -197,23 +207,35 @@ func (h *localCubeRunTemplateManager) EnsureCubeRunTemplate(ctx context.Context,
 	if cloned != nil {
 		return cloned, nil
 	}
-	if err := h.recoverLocalTemplatesFromSnapshotRoot(ctx, constants.DefaultSnapshotDir, templateID); err != nil {
-		log.G(ctx).WithFields(CubeLog.Fields{
-			"template_id": templateID,
-			"err":         err.Error(),
-		}).Warn("failed to recover template from snapshot root")
+	backend, err = cow.NormalizeBackend(backend)
+	if err != nil {
+		return nil, err
 	}
-	if err := h.recoverBackendMetadataHomes(ctx, cow.BackendXFS, "cubebox", templateID); err != nil {
-		log.G(ctx).WithFields(CubeLog.Fields{
-			"template_id": templateID,
-			"err":         err.Error(),
-		}).Warn("failed to recover template from xfs snapshot root")
+	reportRecoveryError := func(err error) {
+		if err != nil {
+			log.G(ctx).WithFields(CubeLog.Fields{
+				"template_id": templateID,
+				"backend":     backend,
+				"err":         err.Error(),
+			}).Warn("failed to recover run template")
+		}
 	}
-	if err := h.recoverS3LocalTemplates(ctx, templateID); err != nil {
-		log.G(ctx).WithFields(CubeLog.Fields{
-			"template_id": templateID,
-			"err":         err.Error(),
-		}).Warn("failed to recover template from s3 snapshot root")
+	// Only inspect the requested backend. In particular, a local XFS miss
+	// must never wait for a shared JuiceFS mount or scan other nodes.
+	switch backend {
+	case cow.BackendXFS:
+		reportRecoveryError(h.recoverLocalTemplatesFromSnapshotRoot(ctx, constants.DefaultSnapshotDir, templateID))
+		if cloned, err := h.cloneAndHydrate(templateID); err != nil || cloned != nil {
+			return cloned, err
+		}
+		reportRecoveryError(h.recoverBackendMetadataHomes(ctx, backend, "cubebox", templateID))
+	case cow.BackendS3:
+		reportRecoveryError(h.recoverS3LocalTemplates(ctx, templateID))
+	case cow.BackendJFS:
+		reportRecoveryError(h.recoverBackendMetadataHomes(ctx, backend, "cubebox", templateID))
+		if cloned, err := h.cloneAndHydrate(templateID); err != nil || cloned != nil {
+			return cloned, err
+		}
 	}
 	cloned, err = h.cloneAndHydrate(templateID)
 	if err != nil {
@@ -233,8 +255,76 @@ func (h *localCubeRunTemplateManager) SetInstanceType(instanceType string) {
 }
 
 func (h *localCubeRunTemplateManager) recoverS3LocalTemplates(ctx context.Context, templateID string) error {
-	mountS3PackageMetadataForRecovery(ctx, templateID)
+	// Heartbeat recovery has no template id. S3 config.json lives on a metadata
+	// disk that Finalize unmounts, so a directory scan alone sees empty homes
+	// and drops every local S3 template after Cubelet restarts. Mount each
+	// package home first; a known id still mounts only that package.
+	for _, id := range s3RecoveryIDs(ctx, templateID, s3SnapshotKindRoots()) {
+		mountS3PackageMetadataForRecovery(ctx, id)
+	}
 	return h.recoverBackendMetadataHomes(ctx, cow.BackendS3, "s3", templateID)
+}
+
+func s3SnapshotKindRoots() []string {
+	return []string{
+		storage.SnapshotKindRoot(cow.BackendS3, storage.SnapshotKindNormal),
+		storage.SnapshotKindRoot(cow.BackendS3, storage.SnapshotKindPause),
+	}
+}
+
+// s3RecoveryIDs is the set of S3 packages whose metadata disk must be mounted
+// before the host scan can see snapshot/config.json. A specific id mounts
+// only that package. An empty id lists package homes under the snapshot roots;
+// those directories survive reboot even while the metadata disk is unmounted.
+func s3RecoveryIDs(ctx context.Context, templateID string, roots []string) []string {
+	if id := strings.TrimSpace(templateID); id != "" {
+		return []string{id}
+	}
+	return s3PackageIDsUnder(ctx, roots...)
+}
+
+func s3PackageIDsUnder(ctx context.Context, roots ...string) []string {
+	seen := map[string]struct{}{}
+	var ids []string
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.G(ctx).WithFields(CubeLog.Fields{
+					"path": root,
+					"err":  err.Error(),
+				}).Warn("failed to list s3 snapshot homes for template recovery")
+			}
+			continue
+		}
+		// Sandbox homes share <work>/s3/snapshots/<id> with template packages.
+		// Only tpl- directories there are packages. pause-snapshots holds
+		// pause packages, not sandbox homes.
+		pause := filepath.Base(root) == storage.SnapshotKindPause
+		for _, ent := range entries {
+			if !ent.IsDir() {
+				continue
+			}
+			name := ent.Name()
+			if name == "" || strings.HasSuffix(name, ".tmp") {
+				continue
+			}
+			if !pause && !strings.HasPrefix(name, "tpl-") {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			ids = append(ids, name)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // mountS3PackageMetadataForRecovery makes an S3 package's run-template
@@ -281,7 +371,7 @@ func metadataHomeConfigPath(home string) string {
 func (h *localCubeRunTemplateManager) recoverBackendMetadataHomes(ctx context.Context, backend, media, templateID string) error {
 	var first error
 	for _, kind := range []string{storage.SnapshotKindNormal, storage.SnapshotKindPause} {
-		if err := h.recoverMetadataHomes(ctx, storage.SnapshotKindRoot(backend, kind), media, templateID); err != nil && first == nil {
+		if err := h.recoverMetadataHomes(ctx, recoverySnapshotKindRoot(backend, kind), media, templateID); err != nil && first == nil {
 			first = err
 		}
 	}

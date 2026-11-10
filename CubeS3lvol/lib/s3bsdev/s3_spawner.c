@@ -3,8 +3,6 @@
 /*
  *   Thread spawner implementation. The design rationale lives in
  *   include/s3lvol/s3_spawner.h.
- *
- *   Ported from spdk/module/bdev/erofs/bdev_erofs.c (verified in production).
  */
 
 #include "spdk/stdinc.h"
@@ -303,30 +301,6 @@ s3_spawner_run_task(void *(*task_fn)(void *), void *arg)
 
 	spawner_submit_and_wait(&req);
 	return req.task_ret;
-}
-
-int
-s3_spawner_pthread_create(pthread_t *thread, void *(*start_routine)(void *),
-			  void *arg)
-{
-	struct spawner_request req = {
-		.type          = SPAWNER_REQ_CREATE_THREAD,
-		.thread_out    = thread,
-		.start_routine = start_routine,
-		.arg           = arg,
-		.result        = -1,
-	};
-
-	if (!thread || !start_routine) {
-		return -EINVAL;
-	}
-	if (!s3_spawner_is_started()) {
-		SPDK_ERRLOG("spawner not started\n");
-		return -EPERM;
-	}
-
-	spawner_submit_and_wait(&req);
-	return req.result;
 }
 
 int

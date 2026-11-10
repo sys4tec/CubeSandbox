@@ -136,6 +136,50 @@ EOF
   assert_contains "${diff}" "[preserved]"
 }
 
+# CUBE_JFS_IMAGE used to default to the Docker Hub image juicedata/mount.
+# The new template leaves it empty so install.sh selects by MIRROR; an
+# untouched old default must be adopted (i.e. dropped to empty), while an
+# operator override must survive.
+test_three_way_adopts_empty_jfs_image_default() {
+  local new="${TMP_DIR}/new-jfs.example" old="${TMP_DIR}/old-jfs.env"
+  local base="${TMP_DIR}/base-jfs.example"
+  local out="${TMP_DIR}/out-jfs.env" diff="${TMP_DIR}/diff-jfs.txt"
+  cat > "${new}" <<'EOF'
+CUBE_JFS_IMAGE=
+EOF
+  cat > "${base}" <<'EOF'
+CUBE_JFS_IMAGE=juicedata/mount:ce-v1.4.1
+EOF
+  cat > "${old}" <<'EOF'
+CUBE_JFS_IMAGE=juicedata/mount:ce-v1.4.1
+EOF
+
+  merge_env_three_way "${new}" "${old}" "${base}" "" "${out}" "${diff}" 2>/dev/null
+
+  assert_value "${out}" CUBE_JFS_IMAGE ""
+  assert_contains "${diff}" "[default-updated]"
+}
+
+test_three_way_keeps_customized_jfs_image_over_empty_default() {
+  local new="${TMP_DIR}/new-jfs2.example" old="${TMP_DIR}/old-jfs2.env"
+  local base="${TMP_DIR}/base-jfs2.example"
+  local out="${TMP_DIR}/out-jfs2.env" diff="${TMP_DIR}/diff-jfs2.txt"
+  cat > "${new}" <<'EOF'
+CUBE_JFS_IMAGE=
+EOF
+  cat > "${base}" <<'EOF'
+CUBE_JFS_IMAGE=juicedata/mount:ce-v1.4.1
+EOF
+  cat > "${old}" <<'EOF'
+CUBE_JFS_IMAGE=harbor.internal/cube/juicefs:ce-v1.4.1
+EOF
+
+  merge_env_three_way "${new}" "${old}" "${base}" "" "${out}" "${diff}" 2>/dev/null
+
+  assert_value "${out}" CUBE_JFS_IMAGE "harbor.internal/cube/juicefs:ce-v1.4.1"
+  assert_contains "${diff}" "[preserved]"
+}
+
 test_preserves_shell_sensitive_values() {
   local new="${TMP_DIR}/new5.example" old="${TMP_DIR}/old5.env"
   local out="${TMP_DIR}/out5.env" diff="${TMP_DIR}/diff5.txt"
@@ -362,6 +406,56 @@ EOF
   assert_contains "${diff}" "[explicit]"
 }
 
+# Contract boundary: the merge stays generic — a .env value that EQUALS the
+# env.example default is never an explicit override, for toggle keys too.
+# Toggle intent (flipping ONE_CLICK_ENABLE_S3LVOL back to 0 on upgrade) is
+# handled outside the merge by snapshot_one_click_toggles /
+# apply_one_click_toggles (see tests/test_toggle_inputs.sh), and the final
+# value is persisted by install.sh's upsert_env_kv.
+test_dotenv_default_valued_key_not_explicit() {
+  local new="${TMP_DIR}/new_s3lvol.example" old="${TMP_DIR}/old_s3lvol.env"
+  local dotenv="${TMP_DIR}/new_s3lvol.env"
+  local out="${TMP_DIR}/out_s3lvol.env" diff="${TMP_DIR}/diff_s3lvol.txt"
+  cat > "${new}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=0
+CUBE_SANDBOX_MYSQL_PORT=3306
+EOF
+  cat > "${old}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=1
+CUBE_SANDBOX_MYSQL_PORT=3307
+EOF
+  cat > "${dotenv}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=0
+CUBE_SANDBOX_MYSQL_PORT=3306
+EOF
+
+  merge_env_three_way "${new}" "${old}" "" "${dotenv}" "${out}" "${diff}" 2>/dev/null
+
+  # Both keys equal the new defaults, so the old runtime values are preserved
+  # (cp env.example .env regression guard).
+  assert_value "${out}" ONE_CLICK_ENABLE_S3LVOL 1
+  assert_value "${out}" CUBE_SANDBOX_MYSQL_PORT 3307
+  assert_contains "${diff}" "[preserved]"
+  assert_contains "${diff}" "= ONE_CLICK_ENABLE_S3LVOL=1"
+}
+
+test_absent_dotenv_preserves_s3lvol() {
+  local new="${TMP_DIR}/new_s3lvol2.example" old="${TMP_DIR}/old_s3lvol2.env"
+  local out="${TMP_DIR}/out_s3lvol2.env" diff="${TMP_DIR}/diff_s3lvol2.txt"
+  cat > "${new}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=0
+EOF
+  cat > "${old}" <<'EOF'
+ONE_CLICK_ENABLE_S3LVOL=1
+EOF
+
+  merge_env_three_way "${new}" "${old}" "" "" "${out}" "${diff}" 2>/dev/null
+
+  assert_value "${out}" ONE_CLICK_ENABLE_S3LVOL 1
+  assert_contains "${diff}" "[preserved]"
+  assert_contains "${diff}" "= ONE_CLICK_ENABLE_S3LVOL=1"
+}
+
 test_version_lt() {
   version_lt 1.0.0 2.0.0 || fail "1.0.0 < 2.0.0 should be true"
   version_lt v0.2.2 v0.2.3 || fail "v0.2.2 < v0.2.3 should be true"
@@ -469,6 +563,7 @@ ONE_CLICK_CUBEMASTER_BUILD_MODE=local
 ONE_CLICK_CUBELET_BUILD_MODE=local
 ONE_CLICK_CUBE_API_BUILD_MODE=local
 ONE_CLICK_CUBEMASTER_BIN=/tmp/cubemaster
+ONE_CLICK_TEMPLATECENTER_BIN=/tmp/templatecenter
 ENVD_LOCAL_PATH=/tmp/envd
 ONE_CLICK_WEB_DIST_DIR=/tmp/web/dist
 ONE_CLICK_MKCERT_BIN=/tmp/mkcert
@@ -481,6 +576,7 @@ EOF
   for k in \
     ONE_CLICK_CUBEMASTER_BUILD_MODE ONE_CLICK_CUBELET_BUILD_MODE \
     ONE_CLICK_CUBE_API_BUILD_MODE ONE_CLICK_CUBEMASTER_BIN \
+    ONE_CLICK_TEMPLATECENTER_BIN \
     ENVD_LOCAL_PATH ONE_CLICK_WEB_DIST_DIR ONE_CLICK_MKCERT_BIN \
     CUBE_BUILD_TIME; do
     if grep -q "^${k}=" "${out}"; then
@@ -644,6 +740,8 @@ test_preserves_user_customized_value
 test_adds_new_keys_with_defaults
 test_three_way_adopts_new_default_for_untouched_key
 test_three_way_keeps_customized_over_new_default
+test_three_way_adopts_empty_jfs_image_default
+test_three_way_keeps_customized_jfs_image_over_empty_default
 test_preserves_shell_sensitive_values
 test_upsert_env_kv_preserves_shell_sensitive_values
 test_upsert_env_kv_quotes_shell_metachar_only_values
@@ -656,6 +754,8 @@ test_two_way_migrates_legacy_cube_proxy_cert_dir_default
 test_two_way_migrates_single_quoted_legacy_cube_proxy_cert_dir_default
 test_two_way_preserves_custom_cube_proxy_cert_dir
 test_new_dotenv_overrides_take_priority
+test_dotenv_default_valued_key_not_explicit
+test_absent_dotenv_preserves_s3lvol
 test_version_lt
 test_diff_report_redacts_secrets
 test_drops_obsolete_agenthub_keys

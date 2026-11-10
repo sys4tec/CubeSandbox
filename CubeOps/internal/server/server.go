@@ -22,30 +22,47 @@ import (
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/nodemanagement"
 	nmhandler "github.com/tencentcloud/CubeSandbox/CubeOps/internal/nodemanagement/handler"
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/nodemanagement/nodemetric"
+	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/opsagent"
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/service"
 	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/store"
-	cubelog "github.com/tencentcloud/CubeSandbox/cubelog"
+	"github.com/tencentcloud/CubeSandbox/CubeOps/internal/warehouse"
+	cubelog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/blobstore/gateway"
 )
 
 // Server is the CubeOps HTTP server.
 type Server struct {
-	cfg     *config.Config
-	store   *store.Store
-	jm      *auth.JWTManager
-	httpSrv *http.Server
-	cm      *cubemaster.Client
-	nodeSvc *nodemanagement.Service
+	cfg      *config.Config
+	store    *store.Store
+	jm       *auth.JWTManager
+	httpSrv  *http.Server
+	cm       *cubemaster.Client
+	nodeSvc  *nodemanagement.Service
+	importer *warehouse.Importer
+	blobs    warehouse.BlobStore
+	cancel   context.CancelFunc
 }
 
-// New creates a new CubeOps server.
-func New(cfg *config.Config, s *store.Store) *Server {
+// New creates a new CubeOps server. blobs may be nil; warehouse routes then
+// return 501 warehouse_disabled.
+func New(cfg *config.Config, s *store.Store, blobs warehouse.BlobStore) *Server {
 	jm := auth.NewJWTManager(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	cm := cubemaster.New(cfg.CubeMasterAddr)
+	fetch := warehouse.FetchConfig{
+		GitHubRepos: cfg.Warehouse.GitHubRepos,
+		CNBRepos:    cfg.Warehouse.CNBRepos,
+		GitHubToken: cfg.Warehouse.GitHubToken,
+		CNBToken:    cfg.Warehouse.CNBToken,
+		Timeout:     cfg.Warehouse.FetchTimeout,
+	}
+	importer := warehouse.NewImporter(s, blobs, fetch, cfg.Warehouse.WorkDir, cfg.Warehouse.UploadTimeout)
 	return &Server{
-		cfg:   cfg,
-		store: s,
-		jm:    jm,
-		cm:    cm,
+		cfg:      cfg,
+		store:    s,
+		jm:       jm,
+		cm:       cm,
+		importer: importer,
+		blobs:    blobs,
 	}
 }
 
@@ -55,23 +72,37 @@ func (s *Server) Start() error {
 		return fmt.Errorf("nodemetric init: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	nodeSvc, err := nodemanagement.New(ctx, s.store.DB(), nodemanagement.DefaultDeclaredVersionInfo())
+	nodeCtx, nodeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer nodeCancel()
+	nodeSvc, err := nodemanagement.New(nodeCtx, s.store.DB(), nodemanagement.DefaultDeclaredVersionInfo())
 	if err != nil {
 		return fmt.Errorf("init node management service: %w", err)
 	}
 	// Enable sandbox verification on node deletion via CubeMaster.
 	nodeSvc.SetSandboxInventoryChecker(nodemanagement.SandboxInventoryChecker(s.cm))
+	// Wire the ops-agent push channel when configured; without a port the
+	// spec is still persisted and served via pull reconcile.
+	if s.cfg.OpsAgent.Port > 0 {
+		nodeSvc.SetOpsAgentPusher(opsagent.New(s.cfg.OpsAgent.Port, s.cfg.OpsAgent.PushTimeout))
+		logging.G(nodeCtx).Infof("ops-agent push enabled: port=%d", s.cfg.OpsAgent.Port)
+	}
 	s.nodeSvc = nodeSvc
 
 	engine := s.buildRouter()
 
+	writeTimeout := s.cfg.Warehouse.UploadTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = 30 * time.Minute
+	}
+	impCtx, impCancel := context.WithCancel(context.Background())
+	s.cancel = impCancel
+	go s.importer.Run(impCtx)
+
 	s.httpSrv = &http.Server{
 		Addr:              s.cfg.Bind,
 		Handler:           engine,
-		ReadHeaderTimeout: 10 * time.Second,  // mitigate Slowloris attacks
-		WriteTimeout:      300 * time.Second, // match nginx proxy_read_timeout
+		ReadHeaderTimeout: 10 * time.Second, // mitigate Slowloris attacks
+		WriteTimeout:      writeTimeout,     // blob download / large upload response
 		IdleTimeout:       120 * time.Second,
 		// ReadTimeout is intentionally NOT set. Go's http.Server.ReadTimeout
 		// covers the entire request body read AND cancels the request context
@@ -90,6 +121,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	logging.G(ctx).Info("CubeOps shutting down")
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.importer != nil {
+		s.importer.ReleaseHeld(ctx)
+	}
 	return s.httpSrv.Shutdown(ctx)
 }
 
@@ -100,6 +137,7 @@ func (s *Server) buildRouter() *gin.Engine {
 	// to stdout and bypasses any logger the operator has configured.
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	r.MaxMultipartMemory = 64 << 20
 	r.Use(requestLogger())
 	r.Use(cubeopsRecovery())
 
@@ -117,7 +155,7 @@ func (s *Server) buildRouter() *gin.Engine {
 	authH := auth.NewHandler(authSvc)
 	clusterH := handler.NewClusterHandler(s.cm).WithNodeService(s.nodeSvc)
 	storeH := handler.NewStoreHandler(handler.DefaultRegistryClient())
-	configH := handler.NewConfigHandler(s.cfg.Bind, 100, s.cfg.JWTSecret != "", s.cfg.SandboxDomain, "cubebox")
+	configH := handler.NewConfigHandler(s.cfg.Bind, s.cfg.SandboxDomain)
 	agenthubH := handler.NewAgentHubHandler(s.store, s.cm)
 	// SDK handler gets the AgentHubService so that E2B template/snapshot
 	// deletions can reverse-sync AgentHub registrations
@@ -125,6 +163,8 @@ func (s *Server) buildRouter() *gin.Engine {
 
 	internalH := nmhandler.NewInternalHandler(s.nodeSvc)
 	agentH := nmhandler.NewAgentHandler(s.nodeSvc)
+	quotaH := nmhandler.NewQuotaHandler(s.nodeSvc)
+	opsAgentH := nmhandler.NewOpsAgentHandler(s.nodeSvc)
 
 	// Public (no auth) routes — login + refresh.
 	public := r.Group("/api/v1")
@@ -139,6 +179,13 @@ func (s *Server) buildRouter() *gin.Engine {
 	configH.Register(authed)
 	storeH.Register(authed)
 	agenthubH.Register(authed)
+	quotaH.Register(authed)
+
+	warehouseH := handler.NewWarehouseHandler(s.store, s.blobs, s.importer, s.nodeSvc, s.cfg.Warehouse.PresignTTL, s.cfg.Warehouse.UploadMaxBytes)
+	if a, ok := s.blobs.(*warehouse.Adapter); ok && a.Signer() != nil {
+		warehouseH.SetObjectGateway(&gateway.Handler{Store: a.Store, Signer: a.Signer()})
+	}
+	warehouseH.RegisterAdmin(authed)
 
 	// Internal routes — no auth. These endpoints must not be exposed through
 	// nginx or a public Bind address. Callers: CubeMaster, cubeopscli.
@@ -147,6 +194,14 @@ func (s *Server) buildRouter() *gin.Engine {
 	// Internal routes — no auth. These endpoints must not be exposed through
 	// nginx or a public Bind address. Callers: Cubelet (register + heartbeat).
 	agentH.Register(r.Group("/internal/v1/node-agent"))
+
+	// Internal routes for node-local ops-agents (pull reconcile). Same
+	// no-public-exposure rule as the routes above.
+	opsAgentH.Register(r.Group("/internal/v1/ops-agent"))
+
+	// Internal warehouse routes — no auth. Callers: Cubelet (blob download,
+	// preinstall claim/ack, inventory report).
+	warehouseH.RegisterInternal(r.Group("/internal/warehouse"))
 
 	// SDK routes — mounted at both /api/v1/sdk and /api/v1/sdk/v2 because
 	// the WebUI and the E2B-compatible clients hit different prefixes.

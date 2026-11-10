@@ -25,7 +25,10 @@ ARG CUBE_BUILD_TIME=unknown
 WORKDIR /workspace
 
 COPY cubecow/ /workspace/cubecow/
-COPY cubelog/ /workspace/cubelog/
+COPY pkgs/CubeLog/ /workspace/pkgs/CubeLog/
+COPY pkgs/proto/ /workspace/pkgs/proto/
+COPY pkgs/sandboxrestart/ /workspace/pkgs/sandboxrestart/
+COPY pkgs/snapshotmode/ /workspace/pkgs/snapshotmode/
 COPY CubeNet/ /workspace/CubeNet/
 COPY Cubelet/ /workspace/Cubelet/
 COPY examples/volume/s3/ /workspace/volume-s3/

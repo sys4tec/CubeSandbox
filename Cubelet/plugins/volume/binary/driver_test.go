@@ -32,9 +32,10 @@ func writeAttachStub(t *testing.T, dir, argsFile string) string {
 	return wrapper
 }
 
+// Not parallel: each test writes its stub script and execs it immediately, and
+// a concurrent fork elsewhere in the package can inherit the still-open write
+// descriptor, making execve fail with ETXTBSY ("text file busy").
 func TestAttachPassesPrivateDataFlag(t *testing.T) {
-	t.Parallel()
-
 	dir := t.TempDir()
 	argsFile := filepath.Join(dir, "args.txt")
 	wrapper := writeAttachStub(t, dir, argsFile)
@@ -71,9 +72,8 @@ func TestAttachPassesPrivateDataFlag(t *testing.T) {
 	}
 }
 
+// Not parallel, for the same reason as TestAttachPassesPrivateDataFlag.
 func TestAttachPassesEmptyPrivateDataFlag(t *testing.T) {
-	t.Parallel()
-
 	dir := t.TempDir()
 	argsFile := filepath.Join(dir, "args.txt")
 	wrapper := writeAttachStub(t, dir, argsFile)
@@ -98,5 +98,27 @@ func TestAttachPassesEmptyPrivateDataFlag(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "--private-data") {
 		t.Fatalf("empty private_data must omit --private-data flag; got %q", raw)
+	}
+}
+
+func TestAttachRejectsNULStateBeforeStartingPlugin(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args.txt")
+	wrapper := writeAttachStub(t, dir, argsFile)
+	p := New("nul-fixture")
+	if err := p.Init(context.Background(), volume.PluginConfig{BinaryPath: wrapper}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := p.Attach(context.Background(), &volume.AttachRequest{
+		VolumeID: "vol-nul", PrivateData: "state-before\x00state-after", VolumeBaseDir: dir,
+	})
+	if err == nil || !strings.Contains(err.Error(), "NUL") || !strings.Contains(err.Error(), "vol-nul") || !strings.Contains(err.Error(), "nul-fixture") {
+		t.Fatalf("expected contextual NUL error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "state-before") {
+		t.Fatalf("error must not echo state: %v", err)
+	}
+	if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+		t.Fatalf("plugin must not start: argv file stat = %v", err)
 	}
 }

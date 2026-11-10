@@ -1,6 +1,6 @@
 # 从 OCI 镜像制作模板
 
-本文介绍如何从标准 OCI 容器镜像出发，完成模板的创建、进度监控和删除操作。
+本文介绍如何从标准 OCI 容器镜像出发，完成模板的创建、进度监控、可选的 `tpl merge` 存储迁移，以及删除操作。
 
 建议在开始前先阅读[模板概览](../templates.md)，了解 OCI 镜像、模板快照、端口、探针和 `envd` 等相关概念。
 
@@ -36,7 +36,7 @@ cubemastercli tpl create-from-image \
   --probe-path /health
 ```
 
-> 加上 `--backend s3` 后，模板及其派生的沙箱 / 快照会走集群共享的 S3 CoW 后端，这是 [跨机 Pause / Resume / FromSnap](../cross-node-snapshot.md) 的前提。省略该标志则沿用历史 `xfs` 路径。
+> 加上 `--backend s3` 后，模板及其派生的沙箱 / 快照会走集群共享的 S3 CoW 后端，这是 [跨机 Pause / Resume / FromSnap](../cross-node-snapshot/requirements.md) 的前提。省略该标志则沿用历史 `xfs` 路径。
 
 
 构建模板的过程可以暴露多个端口以及自定义探针路径，也可以传入环境变量
@@ -52,6 +52,16 @@ cubemastercli tpl create-from-image \
   --env        MY_ENV=production
 ```
 
+`--user` 指定模板构建进程、以及之后从该模板创建的沙箱的容器用户。写法是 `uid`、`uid:gid`、`用户名` 或 `用户名:gid`，组必须是数字。不传 `--user` 时仍然以 root 运行，和以前一样。
+
+```bash
+cubemastercli tpl create-from-image \
+  --image     ghcr.io/tencentcloud/cubesandbox-base:latest \
+  --writable-layer-size 1G \
+  --user      1000:1000
+```
+
+`POST /templates` 的字段名也是 `user`。模板构建仍然保持 privileged，构建过程才能准备设备；变的只是容器进程的用户。
 
 ## 第三步 — 监控进度
 
@@ -170,14 +180,58 @@ cubemastercli tpl info tpl-748094d2f2374b0a8a37e6ec --json --include-request
 cubemastercli tpl render --template-id tpl-748094d2f2374b0a8a37e6ec --json
 ```
 
-如果你更关心“应该看什么、如何一步步预览最终请求”，可继续阅读[模板检查与请求预览](../template-inspection-and-preview.md)。
+关于镜像 `ENV`、模板 `--env` 以及 Sandbox 运行时环境变量的作用域和覆盖规则，见[环境变量](../environment-variables.md)。
 
+## 第五步 — （可选）把历史本地 artifact 迁入 TC 存储
 
-## 删除模板
+大多数**新建**的 `from-image` 模板已经沿当前数据面直接走 TC 构建，因此**不一定需要再手动执行 `tpl merge`**。`tpl merge` 主要用于以下场景：
+
+- 历史模板的 rootfs ext4 还只在 CubeMaster 本地磁盘上
+- 集群后来开启了 `s3Backed=true`，希望把旧模板收敛进 S3 / TC artifact store
+- artifact 已经迁移过，但你想再次触发幂等检查并清理遗留的本地 ext4 文件
+
+命令名叫 `merge`，对应的 API 路径是 `/cube/template/migrate`。默认会阻塞到 migrate job 结束：
+
+```bash
+cubemastercli tpl merge tpl-748094d2f2374b0a8a37e6ec
+```
+
+如果只想提交 migrate job 就返回，可使用：
+
+```bash
+cubemastercli tpl merge tpl-748094d2f2374b0a8a37e6ec --detach
+```
+
+这里的 `merge` 指的是**artifact 存储迁移**，不是 `tpl render` 里看到的 `merged_request` 请求合并。
+
+如果你在处理的是**存量镜像对应的历史模板**，文档口径应统一为：**`tpl merge` 解决历史 artifact 的存储收敛问题，`tpl redo` 解决节点侧重新分发 / 必要时重建问题。**
+
+典型场景是：模板最初的 artifact 仍保存在 `CubeMaster` 本地盘，后续集群开启了 `s3Backed=true`，需要将这批历史 artifact 从本地盘迁移到 **S3 托管存储**。如果同一次运维还需要让模板重新覆盖目标节点，可以按下面的顺序执行：
+
+```bash
+cubemastercli tpl merge tpl-748094d2f2374b0a8a37e6ec
+cubemastercli tpl redo --template-id tpl-748094d2f2374b0a8a37e6ec
+```
+
+> **高亮提醒**
+> 在默认共盘 / 共享 PVC 部署里，即使跳过 `tpl merge`，现有 `READY` 模板通常也**仍可继续下载**；真正的问题是这些历史 artifact 仍未完成从**本地盘到 S3 托管存储**的收敛。
+>
+> - **存储侧**：开启 `s3Backed=true` 后，旧模板不会自动补做迁移。
+> - **恢复侧**：如果本地 ext4 已经丢失，再补跑 `tpl merge` 也修不回来，因为已经没有可上传的文件；这时只能对可重建的 `from-image` 模板执行 `tpl redo`，回退到重建流程。
+
+## 第六步 — 删除模板
 
 ```bash
 cubemastercli tpl delete tpl-748094d2f2374b0a8a37e6ec
+
+# 一次删除多个模板
+cubemastercli tpl delete tpl-first tpl-second tpl-third
+
+# 使用 --force 清除卡住的构建工作
+cubemastercli tpl delete --force tpl-748094d2f2374b0a8a37e6ec
 ```
+
+传入多个模板 ID 时，即使其中某个模板删除失败，CLI 也会继续尝试删除其余模板，最后汇总返回失败项。
 
 成功后输出：
 
@@ -185,7 +239,9 @@ cubemastercli tpl delete tpl-748094d2f2374b0a8a37e6ec
 template deleted: tpl-748094d2f2374b0a8a37e6ec
 ```
 
-> ⚠️ 删除操作会同时移除模板元数据和所有节点上的 artifact 副本。已基于该模板运行的沙箱**不受影响**，但此后无法再用该模板创建新沙箱。
+`--force` 只用于清除卡住的构建任务或定义构建，使删除可以继续；它不会覆盖使用中检查：只要仍有运行中的沙箱依赖该模板，后端就会拒绝删除，包括带 `--force` 的请求。
+
+> ⚠️ 删除操作会同时移除模板元数据和所有节点上的 artifact 副本。删除后无法再用该模板创建新沙箱。
 
 
 ## 常见问题

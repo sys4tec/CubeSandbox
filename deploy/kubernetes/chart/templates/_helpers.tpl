@@ -39,22 +39,28 @@ Cube-owned images should use `cube.cubeImage` instead.
 {{- end -}}
 
 {{- /*
-Render "<repository>:<tag>" for a Cube-owned image with optional
-$.Values.global.imageRegistry override applied to the registry portion of
-.repository. Call as:
+Official Cube TCR hosts that global.imageRegistry may rewrite.
+*/}}
+{{- define "cube.officialImageRegistries" -}}
+cube-sandbox-int.tencentcloudcr.com,cube-sandbox-cn.tencentcloudcr.com
+{{- end -}}
+
+{{- /*
+Render "<repository>:<tag>" for a Cube-owned image. Call as:
   include "cube.cubeImage" (dict "image" .Values.images.master "context" $)
-When global.imageRegistry is empty the output is identical to cube.image;
-setting it rewrites the leading registry host (segment before the first "/")
-so the same chart can be republished to any private registry without editing
-each per-image entry. Everything after the first "/" (the repository path)
-is preserved.
+When global.imageRegistry is set, the leading host of .repository is
+rewritten to it — but only if it is an official Cube TCR host
+(cube.officialImageRegistries); other repositories render unchanged.
+Without it the output is identical to cube.image.
 */}}
 {{- define "cube.cubeImage" -}}
 {{- $image := .image -}}
 {{- $ctx := .context -}}
 {{- $repo := $image.repository -}}
 {{- $override := (default (dict) $ctx.Values.global).imageRegistry | default "" -}}
-{{- if $override -}}
+{{- $host := index (splitList "/" $repo) 0 -}}
+{{- $official := splitList "," (include "cube.officialImageRegistries" .context) -}}
+{{- if and $override (has $host $official) -}}
   {{- $parts := splitList "/" $repo -}}
   {{- if gt (len $parts) 1 -}}
     {{- $repo = printf "%s/%s" (trimSuffix "/" $override) (join "/" (rest $parts)) -}}
@@ -93,6 +99,15 @@ affinity:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- with .Values.placement.compute.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{- /* Helm tests except node-runtime-test: both plane taints, no nodeSelector. */ -}}
+{{- define "cube.testPlacement" -}}
+{{- $tolerations := concat (.Values.placement.controlPlane.tolerations | default list) (.Values.placement.compute.tolerations | default list) -}}
+{{- with $tolerations }}
 tolerations:
   {{- toYaml . | nindent 2 }}
 {{- end }}
@@ -176,8 +191,28 @@ tolerations:
 {{- printf "%s-master" (include "cube.fullname" .) -}}
 {{- end -}}
 
+{{- define "cube.opsAgentName" -}}
+{{- printf "%s-ops-agent" (include "cube.fullname" .) -}}
+{{- end -}}
+
+{{- /*
+ops-agent deploys on compute nodes whenever a CubeOps endpoint is reachable:
+the built-in control plane, or an external one (compute-only mode).
+*/ -}}
+{{- define "cube.opsAgentEnabled" -}}
+{{- if and .Values.cubeNode.enabled (or (eq (include "cube.opsEnabled" .) "true") .Values.externalControlPlane.enabled) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
 {{- define "cube.apiName" -}}
 {{- printf "%s-api" (include "cube.fullname" .) -}}
+{{- end -}}
+
+{{- define "cube.templateCenterName" -}}
+{{- printf "%s-templatecenter" (include "cube.fullname" .) -}}
+{{- end -}}
+
+{{- define "cube.trustedCaConfigMapName" -}}
+{{- printf "%s-trusted-ca" (include "cube.fullname" .) -}}
 {{- end -}}
 
 {{- define "cube.cubemastercliName" -}}
@@ -288,8 +323,10 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 300s;
-            proxy_send_timeout 300s;
+            client_max_body_size 8g;
+            proxy_request_buffering off;
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
 
             proxy_pass {{ $opsUpstream }}/api/;
         }
@@ -300,8 +337,9 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 300s;
-            proxy_send_timeout 300s;
+            client_max_body_size 8g;
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
 
             rewrite ^/cubeapi/v1/(.*)$ /api/v1/sdk/$1 break;
             proxy_pass {{ $opsUpstream }};
@@ -322,8 +360,9 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 300s;
-            proxy_send_timeout 300s;
+            client_max_body_size 8g;
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
 
             rewrite ^/(.*)$ /api/v1/sdk/$1 break;
             proxy_pass {{ $opsUpstream }};
@@ -430,6 +469,13 @@ http {
 {{- end -}}
 
 {{/*
+Rendered CubeMaster conf. The master Deployment checksums it so config edits roll Pods.
+*/}}
+{{- define "cube.masterConf" -}}
+{{- tpl (.Files.Get "files/cube-master/conf.yaml") . -}}
+{{- end -}}
+
+{{/*
 cube.adminToken resolves the shared CubeProxy admin token. CubeProxy reads it at
 runtime as CUBE_PROXY_ADMIN_TOKEN and the lifecycle manager as CUBE_LCM_ADMIN_TOKEN
 from the release Secret key cube-admin-token; CubeMaster needs the same value
@@ -458,11 +504,41 @@ see validate.yaml) to avoid the double generation entirely.
 {{- end -}}
 {{- end -}}
 
+{{- define "cube.templateCenterConfigSecretName" -}}
+{{- printf "%s-templatecenter-config" (include "cube.fullname" .) -}}
+{{- end -}}
+
+{{/*
+cube.templateCallbackToken resolves the shared secret gating CubeTemplateCenter's
+build-status callbacks to CubeMaster (POST /internal/template/jobs/:job_id/status;
+both sides read it as CUBE_TEMPLATE_CALLBACK_TOKEN). Persisted as the
+cube-template-callback-token key in the release Secret, looked up first so
+upgrades keep the value stable. Unlike cube.adminToken every consumer reads it
+via secretKeyRef at runtime, so there is no fresh-install double generation.
+*/}}
+{{- define "cube.templateCallbackToken" -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "cube.secretName" .) -}}
+{{- if and $existing $existing.data (index $existing.data "cube-template-callback-token") -}}
+{{- index $existing.data "cube-template-callback-token" | b64dec -}}
+{{- else -}}
+{{- randAlphaNum 32 -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "cube.masterStoragePVCName" -}}
 {{- if .Values.controlPlane.master.persistence.existingClaim -}}
 {{- .Values.controlPlane.master.persistence.existingClaim -}}
 {{- else -}}
 {{- printf "%s-master-storage" (include "cube.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Join a string or list into a comma-separated CubeOps warehouse env value. */}}
+{{- define "cube.csvOrString" -}}
+{{- if kindIs "string" . -}}
+{{- . -}}
+{{- else -}}
+{{- join "," . -}}
 {{- end -}}
 {{- end -}}
 
@@ -581,6 +657,167 @@ chart-owned StorageClass). This helper only picks which SC name a PVC binds to.
 {{- end -}}
 
 {{/*
+Render a bool env value that defaults to true. Helm's `default` treats
+false as empty, so callers must not use `| default true` for these knobs.
+*/}}
+{{- define "cube.boolEnvDefaultTrue" -}}
+{{- if kindIs "bool" . -}}
+{{- ternary "true" "false" . -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+cubeOps.s3.endpoint > volumeS3.endpoint > chart MinIO.
+*/}}
+{{- define "cube.opsS3Endpoint" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.endpoint) | default "") "" -}}
+{{- $s3.endpoint -}}
+{{- else if ne (((.Values.volumeS3).endpoint) | default "") "" -}}
+{{- .Values.volumeS3.endpoint -}}
+{{- else if eq (include "cube.minioBuiltinEnabled" .) "true" -}}
+{{- include "cube.minioEndpoint" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsS3NodeEndpoint" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.nodeEndpoint) | default "") "" -}}
+{{- $s3.nodeEndpoint -}}
+{{- else -}}
+{{- include "cube.opsS3Endpoint" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsS3SecretName" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.existingSecret) | default "") "" -}}
+{{- $s3.existingSecret -}}
+{{- else -}}
+{{- include "cube.secretName" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsS3Bucket" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- $s3.bucket | default "cube-ops" -}}
+{{- end -}}
+
+{{- define "cube.opsS3Region" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.region) | default "") "" -}}
+{{- $s3.region -}}
+{{- else if ne (((.Values.volumeS3).region) | default "") "" -}}
+{{- .Values.volumeS3.region -}}
+{{- else -}}
+us-east-1
+{{- end -}}
+{{- end -}}
+
+{{/*
+Artifact-store S3 env (CUBE_S3_*) for the cube-master and cube-templatecenter
+pods when controlPlane.artifactStore.s3Backed=true. These are the exact names
+TC's S3Config and CubeMaster's artifact_url_refresh read. Resolution mirrors
+the one-click fill: volumeS3.* is the source of truth, chart MinIO the
+fallback. AK/SK go through the release Secret (s3-artifact-* keys rendered in
+secret.yaml) so they never appear in pod YAML.
+*/}}
+{{- define "cube.artifactS3Bucket" -}}
+{{- $volumeS3 := default dict .Values.volumeS3 -}}
+{{- if ne (($volumeS3.bucket) | default "") "" -}}
+{{- $volumeS3.bucket -}}
+{{- else -}}
+{{- (.Values.minio).bucket | default "cube-volumes" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+True when global.env already carries a COMPLETE CUBE_S3_* set (operator-managed
+S3 env; the chart then injects nothing). Both the modern key names and the
+legacy CUBE_S3_ACCESS_KEY / CUBE_S3_SECRET_KEY fallbacks the binaries still
+read count as complete.
+*/}}
+{{- define "cube.globalEnvS3State" -}}
+{{- $endpoint := false -}}
+{{- $bucket := false -}}
+{{- $ak := false -}}
+{{- $sk := false -}}
+{{- range ((.Values.global).env | default list) -}}
+{{- $n := .name | default "" -}}
+{{- if eq $n "CUBE_S3_ENDPOINT" }}{{- $endpoint = true -}}{{- end -}}
+{{- if eq $n "CUBE_S3_BUCKET" }}{{- $bucket = true -}}{{- end -}}
+{{- if or (eq $n "CUBE_S3_ACCESS_KEY_ID") (eq $n "CUBE_S3_ACCESS_KEY") }}{{- $ak = true -}}{{- end -}}
+{{- if or (eq $n "CUBE_S3_SECRET_ACCESS_KEY") (eq $n "CUBE_S3_SECRET_KEY") }}{{- $sk = true -}}{{- end -}}
+{{- end -}}
+{{- if and $endpoint $bucket $ak $sk -}}complete{{- else if $endpoint -}}partial{{- else -}}absent{{- end -}}
+{{- end -}}
+
+{{/*
+True when the chart can inject a COMPLETE CUBE_S3_* set into the master/TC
+pods: endpoint resolvable (volumeS3.endpoint or builtin MinIO) and credentials
+available in env-injectable form (volumeS3.accessKeyId + secretAccessKey
+rendered into the release Secret, or the builtin MinIO root credentials).
+volumeS3.existingSecret ships a volume-s3.conf FILE, not env keys, so it
+cannot feed env injection -- combine it with global.env instead.
+*/}}
+{{- define "cube.artifactS3Injectable" -}}
+{{- $volumeS3 := default dict .Values.volumeS3 -}}
+{{- $hasPlainCreds := and (ne (($volumeS3.accessKeyId) | default "") "") (ne (($volumeS3.secretAccessKey) | default "") "") -}}
+{{- if and (ne (include "cube.volumeS3EffectiveEndpoint" .) "") (or $hasPlainCreds (eq (include "cube.minioBuiltinEnabled" .) "true")) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+Path style for the artifact store S3 client (CUBE_S3_USE_PATH_STYLE). The
+builtin MinIO is only reachable path-style: virtual-host addressing would
+resolve <bucket>.cube-minio.<ns>.svc..., which cluster DNS cannot resolve
+(the chart already writes -ouse_path_request_style into volume-s3.conf for
+the same reason). An external volumeS3 endpoint keeps the binary default
+(false = virtual-host, AWS-style) unless the operator sets volumeS3.pathStyle.
+*/}}
+{{- define "cube.artifactS3PathStyle" -}}
+{{- $volumeS3 := default dict .Values.volumeS3 -}}
+{{- if ne (($volumeS3.endpoint) | default "") "" -}}
+{{- if hasKey $volumeS3 "pathStyle" -}}
+{{- $volumeS3.pathStyle | toString -}}
+{{- else -}}
+false
+{{- end -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+The CUBE_S3_* env block rendered into BOTH the cube-master and
+cube-templatecenter Deployments. Emitted only when s3Backed=true and
+global.env does not already carry the set; placed BEFORE the global.env block
+so an operator entry with the same name still wins (on duplicate env names
+kubelet keeps the last one).
+*/}}
+{{- define "cube.artifactS3Env" -}}
+{{- if and (((.Values.controlPlane.artifactStore).s3Backed) | default false) (eq (include "cube.globalEnvS3State" .) "absent") (eq (include "cube.artifactS3Injectable" .) "true") }}
+- name: CUBE_S3_ENDPOINT
+  value: {{ include "cube.volumeS3EffectiveEndpoint" . | quote }}
+- name: CUBE_S3_BUCKET
+  value: {{ include "cube.artifactS3Bucket" . | quote }}
+- name: CUBE_S3_USE_PATH_STYLE
+  value: {{ include "cube.artifactS3PathStyle" . | quote }}
+- name: CUBE_S3_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "cube.secretName" . }}
+      key: s3-artifact-access-key-id
+- name: CUBE_S3_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "cube.secretName" . }}
+      key: s3-artifact-secret-access-key
+{{- end }}
+{{- end -}}
+
+{{/*
 Effective S3 plugin endpoint. volumeS3.* is the source of truth; when MinIO is
 enabled and the operator left volumeS3.endpoint empty, fill from chart MinIO
 (same as one-click filling CUBE_S3_* after deploying MinIO).
@@ -627,6 +864,47 @@ enabled and the operator left volumeS3.endpoint empty, fill from chart MinIO
 {{- end -}}
 {{- end -}}
 
+{{- /*
+Base URL CubeMaster uses for CUBE_TEMPLATE_CENTER_ADDR, and that TC's reporter
+uses in reverse for CUBE_MASTER_ADDR. Always the in-cluster ClusterIP
+Service: the optional CLB below is for reaching TC from OUTSIDE the cluster, and
+routing control-plane-internal traffic through a load balancer would add a hop
+and a failure domain for no benefit.
+*/ -}}
+{{- define "cube.templateCenterEndpoint" -}}
+{{- if and .Values.controlPlane.enabled (not .Values.externalControlPlane.enabled) -}}
+{{- printf "http://%s.%s.svc.%s:%v" (include "cube.templateCenterName" .) .Release.Namespace (include "cube.clusterDomain" .) .Values.controlPlane.templateCenter.service.port -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+CubeMaster no longer has a templatecenter_enabled switch: every template build
+is forwarded to CubeTemplateCenter. This helper is kept only so existing chart
+values do not break; it always renders "true" because there is no local build
+mode left to gate.
+*/ -}}
+{{- define "cube.templateCenterEnabledConf" -}}
+{{- "true" -}}
+{{- end -}}
+
+{{- /*
+Claim backing TC's artifact store.
+
+Defaults to CubeMaster's claim, because the two processes MUST see the same
+directory: TC writes the ext4 and CubeMaster serves it over
+/cube/template/artifact/download (design 9.7). ReadWriteOnce means single NODE,
+not single Pod, so co-located Pods can both mount it — which is what the
+podAffinity in templatecenter.yaml enforces.
+*/ -}}
+{{- define "cube.templateCenterStorageClaimName" -}}
+{{- if .Values.controlPlane.templateCenter.persistence.existingClaim -}}
+{{- .Values.controlPlane.templateCenter.persistence.existingClaim -}}
+{{- else -}}
+{{- include "cube.masterStoragePVCName" . -}}
+{{- end -}}
+{{- end -}}
+
+
 {{- define "cube.cubemastercliMasterAddress" -}}
 {{- $endpoint := include "cube.cubemastercliMasterEndpoint" . -}}
 {{- $withoutHTTP := trimPrefix "http://" (trimPrefix "https://" $endpoint) -}}
@@ -670,6 +948,19 @@ enabled and the operator left volumeS3.endpoint empty, fill from chart MinIO
 {{- .Values.externalControlPlane.opsEndpoint -}}
 {{- else -}}
 {{- printf "%s.%s.svc.%s:%v" (include "cube.opsName" .) .Release.Namespace (include "cube.clusterDomain" .) .Values.cubeOps.service.port -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+opsEndpoint guaranteed to carry an http(s):// scheme. The external value may
+already include one, the in-cluster FQDN does not.
+*/ -}}
+{{- define "cube.opsEndpointHTTP" -}}
+{{- $e := include "cube.opsEndpoint" . -}}
+{{- if or (hasPrefix "http://" $e) (hasPrefix "https://" $e) -}}
+{{- $e -}}
+{{- else -}}
+{{- printf "http://%s" $e -}}
 {{- end -}}
 {{- end -}}
 
@@ -785,12 +1076,17 @@ CUBE_SANDBOX_MYSQL_* alone is always assembled as mysql://.
 {{- end -}}
 
 {{- define "cube.redisBuiltinEnabled" -}}
-{{- if and (or .Values.controlPlane.enabled (eq (include "cube.proxyEnabled" .) "true")) .Values.redis.enabled (not .Values.redis.host) (ne (include "cube.redisSentinelEnabled" .) "true") -}}true{{- else -}}false{{- end -}}
+{{- if and (or .Values.controlPlane.enabled (eq (include "cube.proxyEnabled" .) "true")) .Values.redis.enabled (not .Values.redis.host) (not .Values.redis.clusterNodes) (ne (include "cube.redisSentinelEnabled" .) "true") -}}true{{- else -}}false{{- end -}}
 {{- end -}}
 
-{{- /* Master conf nodes: empty under Sentinel; else host:port. */ -}}
+{{- /* Master and TemplateCenter nodes: empty under Cluster or Sentinel. */ -}}
 {{- define "cube.redisNodes" -}}
-{{- if eq (include "cube.redisSentinelEnabled" .) "true" -}}{{- else -}}{{ printf "%s:%v" (include "cube.redisHost" .) .Values.redis.port }}{{- end -}}
+{{- if or .Values.redis.clusterNodes (eq (include "cube.redisSentinelEnabled" .) "true") -}}{{- else -}}{{ printf "%s:%v" (include "cube.redisHost" .) .Values.redis.port }}{{- end -}}
+{{- end -}}
+
+{{- /* Logical Redis DB for Master / Proxy / LCM / Ops (same instance isolation). */ -}}
+{{- define "cube.redisDB" -}}
+{{- .Values.redis.db | default 0 | int -}}
 {{- end -}}
 
 {{- define "cube.egressNetProbeCommand" -}}
@@ -1095,8 +1391,12 @@ Bootstrap: host mutation mounts for pvm / node-init.
   value: {{ .Values.cubeNode.network.ethName | quote }}
 - name: CUBE_SANDBOX_NETWORK_CIDR
   value: {{ .Values.cubeNode.network.cidr | quote }}
+- name: CUBE_SANDBOX_NETWORK_MTU
+  value: {{ if kindIs "invalid" .Values.cubeNode.network.mtu }}"auto"{{ else }}{{ .Values.cubeNode.network.mtu | toString | quote }}{{ end }}
 - name: CUBE_EGRESS_ADMIN_PORT
   value: {{ .Values.cubeEgress.adminPort | quote }}
+- name: CUBE_SANDBOX_OPERATOR_ALLOW_OUT
+  value: {{ join "," .Values.cubeNode.operatorAllowOut | quote }}
 - name: CUBE_SANDBOX_DNS_SERVERS
   {{- if .Values.cubeNode.dns.sandbox.nameservers }}
   value: {{ join "," .Values.cubeNode.dns.sandbox.nameservers | quote }}
@@ -1115,4 +1415,307 @@ Current chart uses per-component /opt/cube-image copy instead.
 set -euo pipefail
 echo "cube.stageToolboxScript is superseded by per-component install containers" >&2
 exit 1
+{{- end -}}
+
+{{- define "cube.s3lvolEnabled" -}}
+{{- if ((.Values.cubeS3lvol).enabled) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsEnabled" -}}
+{{- if ((.Values.cubeJuiceFS).enabled) -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsName" -}}
+{{- printf "%s-juicefs" (include "cube.fullname" .) | trunc 42 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "cube.juicefsRedisName" -}}
+{{- printf "%s-redis" (include "cube.juicefsName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "cube.juicefsRedisPVCName" -}}
+{{- $redis := default dict ((.Values.cubeJuiceFS.metadata).redis) -}}
+{{- $persistence := default dict $redis.persistence -}}
+{{- if (($persistence.existingClaim) | default "") -}}
+{{- $persistence.existingClaim -}}
+{{- else -}}
+{{- printf "%s-data" (include "cube.juicefsRedisName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsRedisPersistenceHash" -}}
+{{- $redis := default dict ((.Values.cubeJuiceFS.metadata).redis) -}}
+{{- $persistence := default dict $redis.persistence -}}
+{{- $spec := dict
+  "enabled" ($persistence.enabled)
+  "existingClaim" (($persistence.existingClaim) | default "")
+  "hostPath" (($persistence.hostPath) | default "")
+  "size" (($persistence.size) | default "")
+  "storageClassName" (include "cube.persistenceStorageClassName" (dict "root" . "component" $persistence))
+  "accessModes" ($persistence.accessModes | default list)
+}}
+{{- toJson $spec | sha256sum -}}
+{{- end -}}
+
+{{- define "cube.juicefsMetadataCredentialHash" -}}
+{{- $meta := default dict ((.Values.cubeJuiceFS).metadata) -}}
+{{- if ne (($meta.password) | default "") "" -}}
+{{- $meta.password | sha256sum -}}
+{{- else if ne (($meta.existingSecret) | default "") "" -}}
+external-secret
+{{- else -}}
+generated-secret
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsMetadataURL" -}}
+{{- $meta := default dict ((.Values.cubeJuiceFS).metadata) -}}
+{{- if ne (($meta.url) | default "") "" -}}
+{{- $meta.url -}}
+{{- else -}}
+{{- $db := 0 -}}
+{{- if hasKey $meta "database" -}}{{- $db = $meta.database | int -}}{{- end -}}
+{{- $redis := default dict $meta.redis -}}
+{{- printf "redis://%s.%s.svc.%s:%v/%v" (include "cube.juicefsRedisName" .) .Release.Namespace (include "cube.clusterDomain" .) ($redis.port | default 6379) $db -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsBucket" -}}
+{{- $storage := default dict ((.Values.cubeJuiceFS).storage) -}}
+{{- if ne (($storage.bucket) | default "") "" -}}
+{{- $storage.bucket -}}
+{{- else -}}
+{{- printf "%s/cube-jfs" (trimSuffix "/" (include "cube.minioEndpoint" .)) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsMetadataSecretName" -}}
+{{- $meta := default dict ((.Values.cubeJuiceFS).metadata) -}}
+{{- if ne (($meta.existingSecret) | default "") "" -}}
+{{- $meta.existingSecret -}}
+{{- else if ne (($meta.secretName) | default "") "" -}}
+{{- $meta.secretName -}}
+{{- else -}}
+{{- printf "%s-meta" (include "cube.juicefsName" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsStorageSecretName" -}}
+{{- $storage := default dict ((.Values.cubeJuiceFS).storage) -}}
+{{- if ne (($storage.existingSecret) | default "") "" -}}
+{{- $storage.existingSecret -}}
+{{- else if ne (($storage.secretName) | default "") "" -}}
+{{- $storage.secretName -}}
+{{- else -}}
+{{- printf "%s-storage" (include "cube.juicefsName" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.juicefsConfigHash" -}}
+{{- $meta := default dict ((.Values.cubeJuiceFS).metadata) -}}
+{{- $storage := default dict ((.Values.cubeJuiceFS).storage) -}}
+{{- $spec := dict
+  "enabled" ((.Values.cubeJuiceFS).enabled)
+  "image" .Values.images.juicefs
+  "volumeName" .Values.cubeJuiceFS.volumeName
+  "mountPath" .Values.cubeJuiceFS.mountPath
+  "root" .Values.cubeJuiceFS.root
+  "cacheDir" .Values.cubeJuiceFS.cacheDir
+  "cacheSizeMB" .Values.cubeJuiceFS.cacheSizeMB
+  "mountOptions" .Values.cubeJuiceFS.mountOptions
+  "metadataURL" (include "cube.juicefsMetadataURL" .)
+  "metadataSecret" (include "cube.juicefsMetadataSecretName" .)
+  "metadataPasswordKey" (($meta.passwordKey) | default "meta-password")
+  "metadataCredentialHash" (include "cube.juicefsMetadataCredentialHash" .)
+  "metadataSecretRevision" (($meta.secretRevision) | default "")
+  "storageType" (($storage.type) | default "s3")
+  "bucket" (include "cube.juicefsBucket" .)
+  "storageSecret" (include "cube.juicefsStorageSecretName" .)
+  "storageAccessKeyKey" (($storage.accessKeyKey) | default "access-key")
+  "storageSecretKeyKey" (($storage.secretKeyKey) | default "secret-key")
+}}
+{{- toJson $spec | sha256sum -}}
+{{- end -}}
+
+{{/* Ports cube-node binds on the host under cubeNode.hostNetwork, for the
+node-init conflict check. Only ports whose holder we can name are listed; see
+deploy/kubernetes/images/scripts/node-prep-lib.sh. */}}
+{{- define "cube.hostPortReserved" -}}
+{{- $ports := list "9998" "9999" "9966" -}}
+{{- if eq (include "cube.s3lvolEnabled" .) "true" -}}
+{{- $ports = append $ports (((.Values.cubeS3lvol).listenPort) | default 4420 | toString) -}}
+{{- end -}}
+{{- join " " $ports -}}
+{{- end -}}
+
+{{- define "cube.s3lvolSocketPath" -}}
+{{- ((.Values.cubeS3lvol).socketPath) | default "/var/run/s3lvol/s3lvol.sock" -}}
+{{- end -}}
+
+{{- define "cube.s3lvolSecretName" -}}
+{{- $s3 := default dict ((.Values.cubeS3lvol).s3) -}}
+{{- if ne (($s3.existingSecret) | default "") "" -}}
+{{- $s3.existingSecret -}}
+{{- else if ne (($s3.secretName) | default "") "" -}}
+{{- $s3.secretName -}}
+{{- else -}}
+{{- printf "%s-s3lvol" (include "cube.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* True when the chart must generate the Secret from chart MinIO root credentials. */}}
+{{- define "cube.s3lvolFillsFromMinio" -}}
+{{- $s3 := default dict ((.Values.cubeS3lvol).s3) -}}
+{{- $userCreds := and (ne (($s3.accessKeyId) | default "") "") (ne (($s3.secretAccessKey) | default "") "") -}}
+{{- if and (eq (include "cube.s3lvolEnabled" .) "true") (eq (($s3.existingSecret) | default "") "") (not $userCreds) (eq (include "cube.minioBuiltinEnabled" .) "true") -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "cube.s3lvolEffectiveEndpoint" -}}
+{{- $s3 := default dict ((.Values.cubeS3lvol).s3) -}}
+{{- if ne (($s3.endpoint) | default "") "" -}}
+{{- $s3.endpoint -}}
+{{- else if ne (include "cube.volumeS3EffectiveEndpoint" .) "" -}}
+{{- include "cube.volumeS3EffectiveEndpoint" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.s3lvolEffectiveBucket" -}}
+{{- $s3 := default dict ((.Values.cubeS3lvol).s3) -}}
+{{- $s3.bucket | default "cube-s3lvol" -}}
+{{- end -}}
+
+{{- define "cube.s3lvolEffectiveRegion" -}}
+{{- $s3 := default dict ((.Values.cubeS3lvol).s3) -}}
+{{- if ne (($s3.region) | default "") "" -}}
+{{- $s3.region -}}
+{{- else if ne (((.Values.volumeS3).region) | default "") "" -}}
+{{- .Values.volumeS3.region -}}
+{{- else -}}
+us-east-1
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.s3lvolPathStyle" -}}
+{{- $s3 := default dict ((.Values.cubeS3lvol).s3) -}}
+{{- if hasKey $s3 "pathStyle" -}}
+{{- if $s3.pathStyle -}}true{{- else -}}false{{- end -}}
+{{- else if eq (include "cube.s3lvolFillsFromMinio" .) "true" -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/* s3.cfg body. Caller passes dict: accessKeyId, secretAccessKey, endpoint, region, bucket, pathStyle. */}}
+{{- define "cube.s3lvolCfgBody" -}}
+{{- $e := .endpoint | toString -}}
+{{- $host := first (splitList "/" (trimPrefix "https://" (trimPrefix "http://" $e))) -}}
+access_key_id="{{ .accessKeyId }}"
+secret_access_key="{{ .secretAccessKey }}"
+endpoint="{{ $host }}"
+region="{{ .region }}"
+buckets=["{{ .bucket }}"]
+{{- if .pathStyle }}
+path_style="true"
+{{- end }}
+{{- if hasPrefix "http://" $e }}
+no_tls="true"
+{{- end }}
+{{- end -}}
+
+{{- define "cube.s3lvolHasResolvedCreds" -}}
+{{- $s3 := default dict ((.Values.cubeS3lvol).s3) -}}
+{{- if ne (($s3.existingSecret) | default "") "" -}}
+true
+{{- else if and (ne (($s3.accessKeyId) | default "") "") (ne (($s3.secretAccessKey) | default "") "") -}}
+true
+{{- else if and (ne (((.Values.volumeS3).accessKeyId) | default "") "") (ne (((.Values.volumeS3).secretAccessKey) | default "") "") -}}
+true
+{{- else if eq (include "cube.minioBuiltinEnabled" .) "true" -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.s3lvolProbeCommand" -}}
+sock={{ include "cube.s3lvolSocketPath" . }}; test -S "${sock}" && python3 /opt/s3lvol/scripts/s3lvol_rpc.py --sock "${sock}" --timeout 5 rcow_get_lvstores >/dev/null
+{{- end -}}
+
+{{/* Big Pod grace = max(cubeNode, cubeS3lvol) terminationGracePeriodSeconds. */}}
+{{- define "cube.nodeTerminationGracePeriodSeconds" -}}
+{{- $grace := int (.Values.cubeNode.terminationGracePeriodSeconds | default 30) -}}
+{{- if eq (include "cube.s3lvolEnabled" .) "true" -}}
+{{- $s3lvolGrace := int (((.Values.cubeS3lvol).terminationGracePeriodSeconds) | default 180) -}}
+{{- if gt $s3lvolGrace $grace -}}
+{{- $s3lvolGrace -}}
+{{- else -}}
+{{- $grace -}}
+{{- end -}}
+{{- else -}}
+{{- $grace -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.artifactStoreBackend" -}}
+{{- $raw := ((.Values.controlPlane.artifactStore).backend) | default "s3" | toString | lower | trim -}}
+{{- if eq $raw "fs" -}}fs{{- else -}}s3{{- end -}}
+{{- end -}}
+
+{{- define "cube.artifactStoreEnv" -}}
+- name: CUBE_ARTIFACT_STORE_BACKEND
+  value: {{ include "cube.artifactStoreBackend" . | quote }}
+{{- $root := ((.Values.controlPlane.artifactStore).fsRoot) | default "" -}}
+{{- if and (eq (include "cube.artifactStoreBackend" .) "fs") $root }}
+- name: CUBE_ARTIFACT_STORE_FS_ROOT
+  value: {{ $root | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "cube.opsStoreBackend" -}}
+{{- $raw := (((.Values.cubeOps).store).backend) | default "s3" | toString | lower | trim -}}
+{{- if eq $raw "fs" -}}fs{{- else -}}s3{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsFSRoot" -}}
+{{- $fs := default dict (((.Values.cubeOps).store).fs) -}}
+{{- $fs.root | default "/var/lib/cubeops/blobs" -}}
+{{- end -}}
+
+{{- define "cube.opsFSPublicURL" -}}
+{{- $fs := default dict (((.Values.cubeOps).store).fs) -}}
+{{- $url := $fs.publicURL | default "" | trim -}}
+{{- if $url -}}
+{{- $url -}}
+{{- else -}}
+{{- printf "http://%s:%v" (include "cube.opsFQDN" .) (.Values.cubeOps.service.port) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsFSShared" -}}
+{{- $fs := default dict (((.Values.cubeOps).store).fs) -}}
+{{- $persist := default dict $fs.persistence -}}
+{{- $modes := $persist.accessModes | default list -}}
+{{- if has "ReadWriteMany" $modes -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsFSPersistEnabled" -}}
+{{- $fs := default dict (((.Values.cubeOps).store).fs) -}}
+{{- $persist := default dict $fs.persistence -}}
+{{- if hasKey $persist "enabled" -}}
+{{- if $persist.enabled -}}true{{- else -}}false{{- end -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsFSClaimName" -}}
+{{- $fs := default dict (((.Values.cubeOps).store).fs) -}}
+{{- $persist := default dict $fs.persistence -}}
+{{- $existing := $persist.existingClaim | default "" -}}
+{{- if $existing -}}
+{{- $existing -}}
+{{- else -}}
+{{- printf "%s-ops-blobs" (include "cube.fullname" .) -}}
+{{- end -}}
 {{- end -}}

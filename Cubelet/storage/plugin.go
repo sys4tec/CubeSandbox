@@ -26,7 +26,7 @@ import (
 	volbinary "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/volume/binary"
 	volrpc "github.com/tencentcloud/CubeSandbox/Cubelet/plugins/volume/rpc"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 )
 
 var cowLookPath = exec.LookPath
@@ -130,20 +130,37 @@ type Config struct {
 
 // CowInlineConfig mirrors the cubecow `AppConfig` schema. Cubelet owns
 // the cubecow init payload and starts one handle per backend.kind.
-// Users may tune `[log]` and `[cow.s3]` (s3lvol socket); reflink
+// Users may tune `[log]` and `[cow.s3]` (s3lvol enable / socket); reflink
 // `root_dir` and s3 `state_dir` are derived from `data_path`.
 type CowInlineConfig struct {
 	Log     CowLogConfig     `toml:"log"`
 	Backend CowBackendConfig `toml:"-"`
 	S3      CowS3UserConfig  `toml:"s3"`
+	JFS     CowJFSUserConfig `toml:"jfs"`
+}
+
+// CowJFSUserConfig is the operator-facing `[cow.jfs]` block. backend=jfs
+// runs one cluster-wide reflink Store on a JuiceFS mount. All nodes share
+// <mount_path>/<root>/{objects,snapshots,pause-snapshots}; Cube guarantees
+// globally unique object names and serializes each object's lifecycle.
+type CowJFSUserConfig struct {
+	Enable    bool   `toml:"enable"`
+	MountPath string `toml:"mount_path"`
+	Root      string `toml:"root"`
+	// CacheDir is the juicefs mount --cache-dir. A package counts as
+	// uploaded, and so restorable on another node, once none of its blocks
+	// is left in the writeback staging area under it.
+	CacheDir string `toml:"cache_dir"`
 }
 
 // CowS3UserConfig is the operator-facing `[cow.s3]` block.
 type CowS3UserConfig struct {
-	SocketPath   *string `toml:"socket_path"`
-	StateDir     *string `toml:"state_dir"`
-	RPCTimeoutMS *uint64 `toml:"rpc_timeout_ms"`
-	SizePolicy   *string `toml:"size_policy"`
+	Enable             bool    `toml:"enable"`
+	SocketPath         *string `toml:"socket_path"`
+	StateDir           *string `toml:"state_dir"`
+	RPCTimeoutMS       *uint64 `toml:"rpc_timeout_ms"`
+	RPCConnectBudgetMS *uint64 `toml:"rpc_connect_budget_ms"`
+	SizePolicy         *string `toml:"size_policy"`
 }
 
 type CowLogConfig struct {
@@ -164,10 +181,11 @@ type CowBackendConfig struct {
 // CowS3BackendConfig is the `[backend.s3]` payload stamped onto the
 // S3 cubecow handle.
 type CowS3BackendConfig struct {
-	SocketPath   *string
-	StateDir     *string
-	RPCTimeoutMS *uint64
-	SizePolicy   *string
+	SocketPath         *string
+	StateDir           *string
+	RPCTimeoutMS       *uint64
+	RPCConnectBudgetMS *uint64
+	SizePolicy         *string
 }
 
 // CowReflinkBackendConfig is the `[backend.reflink]` payload.
@@ -175,7 +193,8 @@ type CowS3BackendConfig struct {
 // live on the same FICLONE-capable filesystem as the rest of
 // cubelet's state.
 type CowReflinkBackendConfig struct {
-	RootDir *string `toml:"-"`
+	RootDir     *string `toml:"-"`
+	CloneMethod *string `toml:"-"`
 }
 
 func (c *Config) BuildCowInitJSON() ([]byte, error) {
@@ -284,6 +303,13 @@ func initS3CowEngineWithConfig(cfg *Config) (*cubecow.Engine, string, error) {
 	return engine, "inline storage.cow s3 handle", err
 }
 
+// s3lvolConfigured reports whether the operator opted into CubeS3lvol by
+// setting [cow.s3] enable = true. socket_path only names the RPC socket;
+// a default path in config.toml is not an opt-in.
+func (c *Config) s3lvolConfigured() bool {
+	return c != nil && c.Cow.S3.Enable
+}
+
 func (c *Config) s3BackendConfig() CowBackendConfig {
 	socket := defaultS3SocketPath
 	if c != nil && c.Cow.S3.SocketPath != nil && strings.TrimSpace(*c.Cow.S3.SocketPath) != "" {
@@ -305,6 +331,9 @@ func (c *Config) s3BackendConfig() CowBackendConfig {
 	}
 	if c != nil && c.Cow.S3.RPCTimeoutMS != nil {
 		out.S3.RPCTimeoutMS = c.Cow.S3.RPCTimeoutMS
+	}
+	if c != nil && c.Cow.S3.RPCConnectBudgetMS != nil {
+		out.S3.RPCConnectBudgetMS = c.Cow.S3.RPCConnectBudgetMS
 	}
 	if c != nil && c.Cow.S3.SizePolicy != nil && strings.TrimSpace(*c.Cow.S3.SizePolicy) != "" {
 		out.S3.SizePolicy = c.Cow.S3.SizePolicy
@@ -350,6 +379,7 @@ func (c CowS3BackendConfig) toMap() map[string]any {
 	setIfNotNil(m, "socket_path", c.SocketPath)
 	setIfNotNil(m, "state_dir", c.StateDir)
 	setIfNotNil(m, "rpc_timeout_ms", c.RPCTimeoutMS)
+	setIfNotNil(m, "rpc_connect_budget_ms", c.RPCConnectBudgetMS)
 	setIfNotNil(m, "size_policy", c.SizePolicy)
 	return m
 }
@@ -357,6 +387,7 @@ func (c CowS3BackendConfig) toMap() map[string]any {
 func (c CowReflinkBackendConfig) toMap() map[string]any {
 	m := map[string]any{}
 	setIfNotNil(m, "root_dir", c.RootDir)
+	setIfNotNil(m, "clone_method", c.CloneMethod)
 	return m
 }
 
@@ -431,6 +462,10 @@ func init() {
 			// would silently find none with the roots still unset.
 			SetSnapshotCatalogRootsFor(cow.BackendXFS, catalogKindRoots(cow.BackendXFS)...)
 			SetSnapshotCatalogRootsFor(cow.BackendS3, catalogKindRoots(cow.BackendS3)...)
+			if localStorage.config.jfsConfigured() {
+				SetSnapshotCatalogRootsFor(cow.BackendJFS, catalogKindRoots(cow.BackendJFS)...)
+			}
+			localStorage.initJFSCow(ic.Context)
 
 			if err := localStorage.init(ic); err != nil {
 				CubeLog.Errorf("plugin %s init fail:%v", constants.StorageID, err)
@@ -443,9 +478,10 @@ func init() {
 				return nil, err
 			}
 
-			// S3 cubecow + metadata base: background retry so cubelet does
-			// not depend on s3lvol being up at startup. S3 requests fail
-			// with ErrS3NotReady until the loop succeeds.
+			// S3 cubecow + metadata base: only when [cow.s3] enable is
+			// true. Background retry so cubelet does not depend on s3lvol
+			// being up at startup; S3 requests fail with ErrS3NotReady
+			// until the loop succeeds.
 			localStorage.startS3CowInitLoop(ic.Context)
 
 			return localStorage, nil
