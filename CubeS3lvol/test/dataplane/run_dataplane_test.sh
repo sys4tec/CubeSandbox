@@ -39,6 +39,10 @@
 #     the flusher, let blobstore write its final metadata, flush that too, close
 #     the log, and only then release the journal and the local device. Getting
 #     that wrong shows up as an assert or a hang, and nowhere else.
+#  6. Whether dest cache plus overlay stay consistent (step 7b). After step 7
+#     the first 16 MiB is in dest cache; a 4 KiB overwrite in one of those
+#     chunks must read back as overlay-merged data, and a neighbouring clean
+#     chunk must still be served from dest cache.
 #
 # === Why the checks are structured this way ===
 #
@@ -50,7 +54,9 @@
 # overlay first, so disconnecting nvme does not prove the data left the process.
 # Step 6b therefore flushes the lvstore, which empties the overlay, and only then
 # does step 7 disconnect, reconnect and re-read. At that point the data can only
-# have come from S3.
+# have come from S3. Step 7b then dirties one of those dest-cached chunks and
+# reads it back without flushing, which is the window dest cache would get
+# wrong if it served the old dest object.
 #
 # Usage:
 #   export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
@@ -253,6 +259,20 @@ for st in stores:
 else:
     print("missing")
 ' "$1"
+}
+
+# True when a write_path counter increased. "missing" is a failure, not zero.
+stat_increased()
+{
+	python3 -c '
+import sys
+try:
+    before = int(sys.argv[1])
+    after = int(sys.argv[2])
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if after > before else 1)
+' "$1" "$2"
 }
 
 # ==========================================================================
@@ -791,7 +811,7 @@ else
 fi
 
 # ==========================================================================
-# [5b] Is the WAL write path actually in use?
+# [5b] Is the shared write-back path actually in use?
 #
 # Everything below would also pass on the direct-to-S3 path, right up to the
 # point where it silently drops concurrent writes. So check explicitly rather
@@ -799,10 +819,10 @@ fi
 # script into a test of the wrong code path.
 # ==========================================================================
 echo
-echo "[5b] confirming the WAL write path is active"
+echo "[5b] confirming the shared write-back path is active"
 
 WAL_ATTACHED="$(wal_stat wal_attached)"
-WAL_WRITES="$(wal_stat wal_writes)"
+WRITEBACK_PUBLISHES="$(wal_stat writeback_publishes)"
 
 if [ "${WAL_ATTACHED}" = "True" ]; then
 	pass "the lvstore reports the WAL path attached"
@@ -811,10 +831,11 @@ else
 	info "every result below would describe the direct-to-S3 path instead"
 fi
 
-if [ "${WAL_WRITES}" != "missing" ] && [ "${WAL_WRITES}" -gt 0 ] 2>/dev/null; then
-	pass "${WAL_WRITES} writes were acknowledged from the log"
+if [ "${WRITEBACK_PUBLISHES}" != "missing" ] &&
+   [ "${WRITEBACK_PUBLISHES}" -gt 0 ] 2>/dev/null; then
+	pass "${WRITEBACK_PUBLISHES} records were published to shared write-back"
 else
-	fail "no write went through the log (wal_writes=${WAL_WRITES})"
+	fail "no write went through shared write-back (writeback_publishes=${WRITEBACK_PUBLISHES})"
 fi
 
 info "chunks flushed to S3 so far: $(wal_stat chunks_flushed)"
@@ -959,6 +980,164 @@ fi
 check_target "step 7, re-reading after the reconnect" || exit 1
 
 # ==========================================================================
+# [7b] Dest cache plus overlay: do not serve a stale dest object
+#
+# Step 7 populated dest cache from S3. A later ordinary 4 KiB write in one of
+# those chunks is acknowledged from shared write-back while dest cache still
+# names the old uuid. Guest FLUSH/FUA deliberately stops at shm durability, so
+# even an fsync would leave this as an overlay-merge case; this section keeps the
+# write plain because durability ordering is covered by the filesystem suite.
+# The 1 MiB containing that 4 KiB is not fully
+# overlay-covered, so dest read must hit cache (or S3) and apply the overlay.
+# The next 1 MiB was not written: dest cache must still serve it, which is the
+# per-chunk bypass.
+# ==========================================================================
+echo
+echo "[7b] dest cache plus overlay (stale dest object must not be served)"
+
+CACHE_ATTACHED="$(wal_stat cache_attached)"
+if [ "${CACHE_ATTACHED}" = "True" ]; then
+	pass "the lvstore reports dest cache attached"
+else
+	fail "dest cache is NOT attached (cache_attached=${CACHE_ATTACHED})"
+fi
+
+python3 - "${WORKDIR}/after.bin" "${WORKDIR}" <<'PY'
+import sys
+from pathlib import Path
+orig = Path(sys.argv[1]).read_bytes()
+out = Path(sys.argv[2])
+if len(orig) < 3 * 1024 * 1024:
+    sys.exit(1)
+out.joinpath("expect_prefix.bin").write_bytes(orig[1 << 20:(1 << 20) + 4096])
+out.joinpath("expect_warm.bin").write_bytes(orig[1 << 20:2 << 20])
+out.joinpath("expect_neighbor.bin").write_bytes(orig[2 << 20:3 << 20])
+PY
+if [ "$?" -ne 0 ]; then
+	fail "step 7b: reconnect image is shorter than 3 MiB"
+	check_target "step 7b, dest cache plus overlay" || exit 1
+fi
+
+HITS_BEFORE="$(wal_stat dest_submit_cache_hits)"
+CACHE_HITS_BEFORE="$(wal_stat cache_hits)"
+if ! dd if="${NVME_DEV}" of="${WORKDIR}/warm_chunk.bin" bs=1M count=1 skip=1 \
+		iflag=direct status=none 2>"${WORKDIR}/dd_warm.log"; then
+	fail "warm dest-cache read of the 1 MiB at offset 1 MiB"
+	sed 's/^/       /' "${WORKDIR}/dd_warm.log"
+else
+	if cmp -s "${WORKDIR}/warm_chunk.bin" "${WORKDIR}/expect_warm.bin"; then
+		pass "warm 1 MiB at offset 1 MiB still matches dest"
+	else
+		fail "warm dest-cache read did not match the reconnect image"
+	fi
+	HITS_WARM="$(wal_stat dest_submit_cache_hits)"
+	CACHE_HITS_WARM="$(wal_stat cache_hits)"
+	if stat_increased "${HITS_BEFORE}" "${HITS_WARM}" ||
+	   stat_increased "${CACHE_HITS_BEFORE}" "${CACHE_HITS_WARM}"; then
+		pass "warm dest read was served from dest cache (hits ${HITS_BEFORE}->${HITS_WARM}, cache_hits ${CACHE_HITS_BEFORE}->${CACHE_HITS_WARM})"
+	else
+		fail "warm dest read did not increment dest_submit_cache_hits or cache_hits"
+	fi
+fi
+
+dd if=/dev/urandom of="${WORKDIR}/dirty4k.bin" bs=4k count=1 status=none
+DIRTY_SEEK=$(((1024 * 1024 + 4096) / 4096))
+OVERLAY_BEFORE="$(wal_stat overlay_bytes)"
+if ! dd if="${WORKDIR}/dirty4k.bin" of="${NVME_DEV}" bs=4k count=1 \
+		seek="${DIRTY_SEEK}" oflag=direct status=none \
+		2>"${WORKDIR}/dd_dirty.log"; then
+	fail "4 KiB overlay write at 1 MiB + 4 KiB"
+	sed 's/^/       /' "${WORKDIR}/dd_dirty.log"
+else
+	OVERLAY_AFTER="$(wal_stat overlay_bytes)"
+	if stat_increased "${OVERLAY_BEFORE}" "${OVERLAY_AFTER}"; then
+		pass "overlay holds the 4 KiB write (${OVERLAY_BEFORE} -> ${OVERLAY_AFTER} bytes)"
+	else
+		fail "overlay_bytes did not grow after the 4 KiB write (${OVERLAY_AFTER})"
+	fi
+fi
+
+python3 - "${WORKDIR}/after.bin" "${WORKDIR}/dirty4k.bin" \
+		"${WORKDIR}/expect_merged.bin" <<'PY'
+from pathlib import Path
+import sys
+orig = Path(sys.argv[1]).read_bytes()
+dirty = Path(sys.argv[2]).read_bytes()
+chunk = bytearray(orig[1 << 20:2 << 20])
+chunk[4096:8192] = dirty
+Path(sys.argv[3]).write_bytes(chunk)
+PY
+
+COVER_HITS_BEFORE="$(wal_stat overlay_hits)"
+if ! dd if="${NVME_DEV}" of="${WORKDIR}/got_dirty4k.bin" bs=4k count=1 \
+		skip="${DIRTY_SEEK}" iflag=direct status=none \
+		2>"${WORKDIR}/dd_got_dirty.log"; then
+	fail "read of the overlay-covered 4 KiB"
+else
+	if cmp -s "${WORKDIR}/got_dirty4k.bin" "${WORKDIR}/dirty4k.bin"; then
+		pass "overlay-covered 4 KiB reads the new write, not dest cache"
+	else
+		fail "overlay-covered 4 KiB still has dest-cache bytes"
+	fi
+	COVER_HITS_AFTER="$(wal_stat overlay_hits)"
+	if stat_increased "${COVER_HITS_BEFORE}" "${COVER_HITS_AFTER}"; then
+		pass "the 4 KiB read was an overlay hit (${COVER_HITS_BEFORE}->${COVER_HITS_AFTER})"
+	else
+		fail "overlay_hits did not increase on the covered 4 KiB read"
+	fi
+fi
+
+if ! dd if="${NVME_DEV}" of="${WORKDIR}/got_prefix.bin" bs=4k count=1 \
+		skip=$((1024 * 1024 / 4096)) iflag=direct status=none \
+		2>"${WORKDIR}/dd_got_prefix.log"; then
+	fail "read of the unwritten 4 KiB in the dirty dest chunk"
+else
+	if cmp -s "${WORKDIR}/got_prefix.bin" "${WORKDIR}/expect_prefix.bin"; then
+		pass "unwritten 4 KiB of the dirty chunk still matches dest cache"
+	else
+		fail "unwritten 4 KiB of the dirty chunk does not match dest"
+	fi
+fi
+
+CACHE_HITS_DIRTY_BEFORE="$(wal_stat cache_hits)"
+if ! dd if="${NVME_DEV}" of="${WORKDIR}/got_merged.bin" bs=1M count=1 skip=1 \
+		iflag=direct status=none 2>"${WORKDIR}/dd_got_merged.log"; then
+	fail "1 MiB read of the dirty dest chunk"
+else
+	if cmp -s "${WORKDIR}/got_merged.bin" "${WORKDIR}/expect_merged.bin"; then
+		pass "dirty dest chunk reads as dest cache with the overlay applied"
+	else
+		fail "dirty dest chunk read is neither dest cache nor overlay-merged"
+	fi
+	CACHE_HITS_DIRTY_AFTER="$(wal_stat cache_hits)"
+	if stat_increased "${CACHE_HITS_DIRTY_BEFORE}" "${CACHE_HITS_DIRTY_AFTER}"; then
+		pass "dirty-chunk merge used dest cache (cache_hits ${CACHE_HITS_DIRTY_BEFORE}->${CACHE_HITS_DIRTY_AFTER})"
+	else
+		fail "dirty-chunk merge did not increment cache_hits"
+	fi
+fi
+
+NEIGHBOR_BEFORE="$(wal_stat dest_submit_cache_hits)"
+if ! dd if="${NVME_DEV}" of="${WORKDIR}/got_neighbor.bin" bs=1M count=1 skip=2 \
+		iflag=direct status=none 2>"${WORKDIR}/dd_got_neighbor.log"; then
+	fail "1 MiB read of the clean neighbouring dest chunk"
+else
+	if cmp -s "${WORKDIR}/got_neighbor.bin" "${WORKDIR}/expect_neighbor.bin"; then
+		pass "clean neighbouring chunk still matches dest cache"
+	else
+		fail "clean neighbouring chunk was disturbed by the overlay write"
+	fi
+	NEIGHBOR_AFTER="$(wal_stat dest_submit_cache_hits)"
+	if stat_increased "${NEIGHBOR_BEFORE}" "${NEIGHBOR_AFTER}"; then
+		pass "clean neighbour was an off-owner dest-cache hit (${NEIGHBOR_BEFORE}->${NEIGHBOR_AFTER})"
+	else
+		fail "clean neighbour did not increment dest_submit_cache_hits"
+	fi
+fi
+
+check_target "step 7b, dest cache plus overlay" || exit 1
+
+# ==========================================================================
 # [8] fio with verify, and the max_num_segments question
 #
 # iodepth > 1 with 1 MiB blocks is what would produce multi-segment I/O if the
@@ -1075,11 +1254,10 @@ else
 
 	# Small blocks at high depth, to stress the chunk boundary logic.
 	#
-	# This is the expensive one by design: with a 1 MiB chunk and no local cache
-	# (s3_cache.c is still a stub), a 4k write that misses the overlay is a
-	# read-modify-write of a whole chunk. 16 MiB of 4k I/O touches 16 chunks, so
-	# the overlay should absorb almost all of it -- if this run ever takes
-	# minutes, that assumption is what to check first.
+	# This is the expensive one by design: with a 1 MiB chunk, a 4k write that
+	# misses the overlay is a read-modify-write of a whole chunk. 16 MiB of 4k
+	# I/O touches 16 chunks, so the overlay should absorb almost all of it --
+	# if this run ever takes minutes, that assumption is what to check first.
 	run_fio "fio randrw 4k iodepth=16 with crc32c verify" \
 		"${WORKDIR}/fio_small.log" \
 		--name=s3lvol_small ${FIO_COMMON} \

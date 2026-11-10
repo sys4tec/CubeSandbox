@@ -2,8 +2,8 @@
 # Copyright (c) 2026 Tencent Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
-#  Regression test for issue 2: an esnap clone that queued a decouple must not
-#  be snapshotable while it waits.
+#  Regression test for issue 2: snapshotting an esnap clone whose decouple is
+#  queued must not leave a decouple that cannot detach.
 #
 #  The field failure it pins down (64-node): a decouple that is queued behind a
 #  slow full-volume materialisation does not hold action_in_progress, so a
@@ -12,17 +12,21 @@
 #  clears it on the origin). The queued decouple then materialised everything
 #  and failed its detach with "blob is not a clone of an external snapshot".
 #
-#  This test reproduces the queue window and asserts the fix: the snapshot is
-#  refused (derive_check sees the volume in the decouple queue), and the
-#  decouple afterwards completes cleanly.
+#  Two imports of different exports still queue, one template each. Snapshotting
+#  the user volume does not cancel its template's decouple: the esnap stays on
+#  __rcow_tpl_<uuid>. What must not happen is a decouple that materialises
+#  everything and then fails to detach.
 #
 #  Scenario:
 #    src: a big volume written full -> snapshot -> export  (the decouple of its
-#         import takes minutes, which is the queue window)
+#         template takes long enough to be the queue window)
 #    src: a small sparse volume -> snapshot -> export
-#    dst: import big (decouple:true)   -- starts materialising, slowly
-#    dst: import small (decouple:true) -- queued behind big
-#    while small is queued: snapshot small -> must be refused
+#    dst: import big (decouple:true)   -- starts materialising its template
+#    dst: import small (decouple:true) -- its template waits behind big
+#    while big is ingesting: partial-write small's first parent-backed cluster
+#         -- must CoW from small's export, never from big's active ingest
+#    while small is queued: snapshot small -> succeeds, and does not cancel
+#    both templates then finish, and a further decouple of small is refused
 #
 #  Usage:
 #    sudo -E ./test/dataplane/repro_issue2.sh -e <endpoint> -b <bucket> [-r <region>]
@@ -178,6 +182,46 @@ nvme_settle()
 	udevadm settle --timeout=5 >/dev/null 2>&1 || true
 }
 
+ctrl_of_nqn()
+{
+	local c
+
+	for c in /sys/class/nvme/nvme*; do
+		if [ "$(cat "${c}/subsysnqn" 2>/dev/null)" = "${NQN}" ]; then
+			printf '/dev/%s' "$(basename "${c}")"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Wait for a 1 GiB namespace on this subsystem. Linux names /dev/nvmeXnY by
+# discovery order, not NVMe nsid, so matching on size is what keeps hold0
+# (4 MiB) and the volumes apart. exclude, if set, is skipped.
+wait_vol_dev()
+{
+	local exclude="${1:-}"
+	local deadline=$(( $(date +%s) + 25 ))
+	local ctrl dev sz
+
+	while [ "$(date +%s)" -lt "${deadline}" ]; do
+		ctrl="$(ctrl_of_nqn)" || { sleep 0.2; continue; }
+		nvme ns-rescan "${ctrl}" >/dev/null 2>&1 || true
+		nvme_settle
+		for dev in $(ls "${ctrl}"n* 2>/dev/null || true); do
+			[ -b "${dev}" ] || continue
+			[ -n "${exclude}" ] && [ "${dev}" = "${exclude}" ] && continue
+			sz="$(blockdev --getsize64 "${dev}" 2>/dev/null || echo 0)"
+			if [ "${sz}" = "${VOL_BYTES}" ]; then
+				printf '%s' "${dev}"
+				return 0
+			fi
+		done
+		sleep 0.2
+	done
+	return 1
+}
+
 remove_prefix()
 {
 	python3 "${TOOLS_DIR}/s3_prefix_rm.py" -e "${ENDPOINT}" -b "${BUCKET}" \
@@ -317,12 +361,22 @@ ${RPC} nvmf_create_transport -t TCP >/dev/null 2>&1 || true
 ${RPC} nvmf_create_subsystem "${NQN}" -a -s R2X0000000000000001 \
 	>/dev/null 2>&1 || { fail "nvmf_create_subsystem"; exit 1; }
 TRANSPORT_READY=1
+# Keep one namespace alive while the source lvstore is unloaded. Otherwise the
+# kernel is free to tear down the controller before the destination import is
+# exposed, making the cross-volume CoW window impossible to drive from /dev.
+${RPC} bdev_null_create hold0 4 4096 >/dev/null 2>&1 \
+	|| { fail "bdev_null_create (controller hold)"; exit 1; }
+HOLD_NSID=30
+BIG_NSID=1
+SMALL_NSID=2
+VOL_BYTES=$((SMALL_GIB * 1024 * 1024 * 1024))
+${RPC} nvmf_subsystem_add_ns "${NQN}" hold0 -n "${HOLD_NSID}" >/dev/null 2>&1 \
+	|| { fail "nvmf_subsystem_add_ns (controller hold)"; exit 1; }
 ${RPC} nvmf_subsystem_add_ns "${NQN}" "${SRC_LVS}/${BIG_VOL}" \
-	>/dev/null 2>&1 || { fail "nvmf_subsystem_add_ns (big)"; exit 1; }
+	-n "${BIG_NSID}" >/dev/null 2>&1 || { fail "nvmf_subsystem_add_ns (big)"; exit 1; }
 ${RPC} nvmf_subsystem_add_listener "${NQN}" -t tcp -a "${LISTEN_ADDR}" \
 	-s "${LISTEN_PORT}" >/dev/null 2>&1 || { fail "add_listener"; exit 1; }
 
-BEFORE_CONNECT="$(ls /dev/nvme*n* 2>/dev/null | sort || true)"
 if ! nvme connect -t tcp -a "${LISTEN_ADDR}" -s "${LISTEN_PORT}" -n "${NQN}" \
 		>"${WORKDIR}/connect.log" 2>&1; then
 	fail "nvme connect"
@@ -330,14 +384,8 @@ if ! nvme connect -t tcp -a "${LISTEN_ADDR}" -s "${LISTEN_PORT}" -n "${NQN}" \
 	exit 1
 fi
 CONNECTED=1
-BIG_DEV=""
-for _ in $(seq 30); do
-	BIG_DEV="$(comm -13 <(echo "${BEFORE_CONNECT}") \
-			<(ls /dev/nvme*n* 2>/dev/null | sort || true) | head -1)"
-	[ -n "${BIG_DEV}" ] && break
-	sleep 0.5
-done
-[ -n "${BIG_DEV}" ] || { fail "no device for big volume"; exit 1; }
+BIG_DEV="$(wait_vol_dev)" \
+	|| { fail "no 1 GiB device for big volume"; exit 1; }
 pass "big volume is ${BIG_DEV}"
 
 info "writing ${BIG_GIB}GiB to ${BIG_VOL} (this is the slow part)"
@@ -363,25 +411,35 @@ raw_rpc rcow_create_lvol "$(printf '{"lvol_name":"%s","size_gib":%d}' \
 	"${SMALL_VOL}" "${SMALL_GIB}")" >/dev/null 2>&1 \
 	|| { fail "create small lvol"; exit 1; }
 ${RPC} nvmf_subsystem_add_ns "${NQN}" "${SRC_LVS}/${SMALL_VOL}" \
-	>/dev/null 2>&1 || { fail "nvmf_subsystem_add_ns (small)"; exit 1; }
-nvme ns-rescan "/dev/$(basename "${BIG_DEV}" | sed 's/n[0-9]*$//')" \
-	>/dev/null 2>&1 || true
-SMALL_DEV=""
-for _ in $(seq 30); do
-	SMALL_DEV="$(comm -13 <(echo "${BEFORE_CONNECT}") \
-			<(ls /dev/nvme*n* 2>/dev/null | sort || true) | grep -v "${BIG_DEV}" \
-			| head -1)"
-	[ -n "${SMALL_DEV}" ] && break
-	sleep 0.5
-done
-[ -n "${SMALL_DEV}" ] || { fail "no device for small volume"; exit 1; }
+	-n "${SMALL_NSID}" >/dev/null 2>&1 || { fail "nvmf_subsystem_add_ns (small)"; exit 1; }
+SMALL_DEV="$(wait_vol_dev "${BIG_DEV}")" \
+	|| { fail "no 1 GiB device for small volume"; exit 1; }
 pass "small volume is ${SMALL_DEV}"
 
 dd if=/dev/urandom of="${WORKDIR}/small.pat" bs=1M count="${SMALL_WRITE_MB}" \
 	status=none
 dd if="${WORKDIR}/small.pat" of="${SMALL_DEV}" bs=1M count="${SMALL_WRITE_MB}" \
 	seek=0 oflag=direct conv=fsync status=none 2>"${WORKDIR}/small_write.err"
+SMALL_SRC_MD5="$(dd if="${SMALL_DEV}" bs=1M count=1 iflag=direct status=none \
+	| md5sum | cut -d' ' -f1)"
+SMALL_PAT_MD5="$(dd if="${WORKDIR}/small.pat" bs=1M count=1 status=none \
+	| md5sum | cut -d' ' -f1)"
+if [ "${SMALL_SRC_MD5}" != "${SMALL_PAT_MD5}" ]; then
+	fail "small source device did not retain the pattern (wrote to the wrong ns?)"
+	exit 1
+fi
+raw_rpc rcow_flush_lvstore "$(printf '{"lvs_name":"%s"}' "${SRC_LVS}")" \
+	>/dev/null 2>&1 || { fail "flush after writing small"; exit 1; }
 pass "small volume written (${SMALL_WRITE_MB} MiB sparse)"
+
+# Expected first MiB after the partial write made while this import is queued
+# behind the big decouple. Only the first 4 KiB changes; the rest must still
+# come from the small export's parent cluster.
+dd if=/dev/urandom of="${WORKDIR}/cow.patch" bs=4096 count=1 status=none
+dd if="${WORKDIR}/small.pat" of="${WORKDIR}/cow.expected" bs=1M count=1 status=none
+dd if="${WORKDIR}/cow.patch" of="${WORKDIR}/cow.expected" bs=4096 count=1 \
+	conv=notrunc status=none
+COW_EXPECTED_MD5="$(md5sum "${WORKDIR}/cow.expected" | cut -d' ' -f1)"
 
 raw_rpc rcow_create_snapshot "$(printf '{"lvol_name":"%s","snapshot_name":"%s"}' \
 	"${SMALL_VOL}" "${SMALL_SNAP}")" >/dev/null 2>&1 \
@@ -392,6 +450,11 @@ SMALL_EXP_UUID="$(raw_rpc rcow_export_snapshot \
 [ -n "${SMALL_EXP_UUID}" ] || { fail "export small snapshot"; exit 1; }
 wait_export_done "${SMALL_EXP_UUID}" "small export" || exit 1
 pass "small snapshot exported (${SMALL_EXP_UUID})"
+
+# Drop the source namespaces before unload so their nsids can be reused for the
+# imported volume. hold0 stays, which is what keeps the controller alive.
+${RPC} nvmf_subsystem_remove_ns "${NQN}" "${BIG_NSID}" >/dev/null 2>&1 || true
+${RPC} nvmf_subsystem_remove_ns "${NQN}" "${SMALL_NSID}" >/dev/null 2>&1 || true
 
 # One blobstore per node: the source lvstore has to be unloaded before the
 # destination can be created. Its export lives in S3, so the import below still
@@ -440,24 +503,90 @@ if ! raw_rpc rcow_import_lvol \
 	exit 1
 fi
 pass "small imported, decouple queued behind big"
+if grep -qE "Sealed shared template '__rcow_tpl_${SMALL_EXP_UUID}'.*: .* 0 of [0-9]+ chunk" "${TGT_LOG}"; then
+	fail "small import has no parent chunks; the CoW check would be vacuous"
+	exit 1
+fi
 
 # ==========================================================================
-echo "[7] while small is queued: snapshot it (must be refused)"
+echo "[7] while big ingests: CoW small must read small's export, not big's"
+# Reuse the source small nsid. hold0 (nsid 30) keeps the controller up across
+# the source unload, so a rescan is enough; reconnecting would also work.
+SMALL_IMP_NSID="${SMALL_NSID}"
+${RPC} nvmf_subsystem_add_ns "${NQN}" "${DST_LVS}/${SMALL_IMP}" \
+	-n "${SMALL_IMP_NSID}" >/dev/null 2>"${WORKDIR}/add_small_imp_ns.err" || {
+	fail "expose imported small"
+	sed 's/^/       /' "${WORKDIR}/add_small_imp_ns.err"
+	exit 1
+}
+SMALL_IMP_DEV="$(wait_vol_dev)" || {
+	fail "imported small 1 GiB device did not appear"
+	exit 1
+}
+BIG_STILL_RUNNING="$(raw_rpc rcow_get_decouple 2>/dev/null | python3 -c "
+import json,sys
+name = sys.argv[1]
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+print(len([r for r in rows if r.get('lvol_name') == name and not r.get('queued')]))
+" "__rcow_tpl_${BIG_EXP_UUID}" 2>/dev/null || echo 0)"
+if [ "${BIG_STILL_RUNNING}" != "1" ]; then
+	fail "big decouple finished before the CoW; the cross-volume window was missed"
+	exit 1
+fi
+pass "imported small is ${SMALL_IMP_DEV}; big ingest still running"
+
+# A 4 KiB overwrite of a parent-backed 1 MiB chunk forces blobstore to preserve
+# the other 1020 KiB through CoW. While the big CopyObject ingest is installed
+# lvstore-wide, the historical bug resolved that read against the big manifest:
+# the write either hung behind ingest slots or the untouched bytes silently
+# came from the wrong export. Bound the write so a regression cannot stall CI.
+if timeout 60 dd if="${WORKDIR}/cow.patch" of="${SMALL_IMP_DEV}" bs=4096 count=1 \
+		oflag=direct conv=fsync status=none 2>"${WORKDIR}/cow_write.err"; then
+	COW_GOT_MD5="$(dd if="${SMALL_IMP_DEV}" bs=1M count=1 iflag=direct \
+		status=none 2>"${WORKDIR}/cow_read.err" | md5sum | cut -d' ' -f1)"
+	if [ "${COW_GOT_MD5}" = "${COW_EXPECTED_MD5}" ]; then
+		pass "queued small CoW preserved bytes from the small export"
+	else
+		fail "queued small CoW used wrong parent bytes (got ${COW_GOT_MD5}, expected ${COW_EXPECTED_MD5})"
+	fi
+else
+	fail "queued small CoW failed or timed out while big ingest was active"
+	sed 's/^/       /' "${WORKDIR}/cow_write.err"
+fi
+
+# ==========================================================================
+echo "[8] while small is queued: snapshot it, which must not cancel that decouple"
 raw_rpc rcow_create_snapshot "$(printf '{"lvol_name":"%s","snapshot_name":"%s"}' \
 	"${SMALL_IMP}" "${SMALL_IMP_SNAP}")" \
 	>"${WORKDIR}/snap_small.json" 2>"${WORKDIR}/snap_small.err"
 SNAP_RC=$?
-if [ "${SNAP_RC}" -ne 0 ]; then
-	pass "snapshot of queued small refused (rc=${SNAP_RC})"
-	if ! grep -qE "is queued to be decoupled" "${TGT_LOG}"; then
-		fail "no 'queued to be decoupled' refusal reason in the log"
-	fi
+if [ "${SNAP_RC}" -eq 0 ]; then
+	pass "snapshot of queued small succeeded (rc=0)"
 else
-	fail "snapshot of queued small succeeded -- a queued esnap clone must not be snapshotable"
+	fail "snapshot of queued small refused (rc=${SNAP_RC})"
+	sed 's/^/    /' "${WORKDIR}/snap_small.err" 2>/dev/null | tail -5
+fi
+
+# The esnap is the hidden template, not this volume, so the snapshot reply must
+# not claim the queued copy was dropped.
+if grep -q 'decouple_cancelled' "${WORKDIR}/snap_small.json" 2>/dev/null; then
+	fail "snapshot reported decouple_cancelled; small's template must keep waiting"
+else
+	pass "snapshot did not cancel small's queued template decouple"
+fi
+
+SMALL_TPL="__rcow_tpl_${SMALL_EXP_UUID}"
+if grep -qE "Cancelling the decouple of lvol '${SMALL_TPL}'" "${TGT_LOG}"; then
+	fail "snapshot cancelled ${SMALL_TPL}"
+else
+	pass "small's template decouple was not cancelled"
 fi
 
 # ==========================================================================
-echo "[8] wait for all decouples to finish"
+echo "[9] wait for all decouples to finish"
 if wait_for_decouple; then
 	pass "all decouples finished"
 else
@@ -465,21 +594,36 @@ else
 fi
 
 # ==========================================================================
-echo "[9] verdict"
+echo "[10] verdict"
 echo "--- relevant log lines:"
 grep -nE 'queued to be decoupled|decouple_start|decouple_finish|Decoupling|blob is not a clone' \
 	"${TGT_LOG}" | tail -40 | sed 's/^/    /' || true
 
+# Snapshotting the user volume must not make either template fail its detach.
 if grep -qE 'blob is not a clone of an external snapshot' "${TGT_LOG}"; then
 	fail "decouple detach failed -- the fix did not hold"
 else
 	pass "no detach failure: every decouple detached cleanly"
 fi
-if grep -qE "Decoupling lvol '${SMALL_IMP}'" "${TGT_LOG}" &&
-   grep -qE "'${SMALL_IMP}' no longer reads export" "${TGT_LOG}"; then
-	pass "${SMALL_IMP} decoupled cleanly after the queued snapshot was refused"
+
+BIG_TPL="__rcow_tpl_${BIG_EXP_UUID}"
+SMALL_TPL="__rcow_tpl_${SMALL_EXP_UUID}"
+if grep -qF "'${BIG_TPL}' no longer reads export" "${TGT_LOG}"; then
+	pass "${BIG_TPL} decoupled cleanly"
 else
-	fail "${SMALL_IMP} did not finish its decouple"
+	fail "${BIG_TPL} did not finish its decouple"
+fi
+if grep -qF "'${SMALL_TPL}' no longer reads export" "${TGT_LOG}"; then
+	pass "${SMALL_TPL} decoupled cleanly after waiting behind big"
+else
+	fail "${SMALL_TPL} did not finish its decouple"
+fi
+raw_rpc rcow_decouple_lvol "$(printf '{"lvol_name":"%s"}' "${SMALL_IMP}")" \
+	>/dev/null 2>"${WORKDIR}/redecouple.err"
+if [ $? -ne 0 ]; then
+	pass "${SMALL_IMP} can no longer be decoupled (its template is already local)"
+else
+	fail "${SMALL_IMP} accepted another decouple after its template finished"
 fi
 
 check_target "step 9" || exit 1

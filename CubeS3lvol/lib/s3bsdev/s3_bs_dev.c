@@ -78,10 +78,12 @@
 #include "s3lvol/s3_overlay.h"
 #include "s3lvol/s3_types.h"
 #include "s3lvol/s3_wal.h"
+#include "s3lvol/s3_writeback.h"
 
-/* How often a write parked by backpressure is retried. Short enough that a
- * transient stall is not noticeable, long enough not to spin. */
-#define S3_RETRY_POLL_US 200
+/* Ring-space release wakes parked writes directly. This poller is only the
+ * fallback for blockers with no explicit wakeup (and for a lost wakeup), so it
+ * does not need to spin every 200 us while S3 is draining a full ring. */
+#define S3_RETRY_POLL_US 1000
 
 /* How often to look at whether a checkpoint is due. Coarse on purpose: the check
  * itself is two integer reads, but the work it starts uploads the whole chunk
@@ -113,6 +115,9 @@
  * checked separately and short-circuits: a quiet lvstore does not PUT a snapshot
  * every interval, it does nothing at all. */
 #define S3_CKPT_DEFAULT_INTERVAL_SEC 60
+/* Whole-object dest GETs are independent of cache staging. Staging (16) only
+ * bounds how many populates may sit on the local device. */
+#define S3_DEST_FILL_MAX_INFLIGHT 64
 
 /* ==========================================================================
  * Internal structures
@@ -130,6 +135,50 @@ struct s3_retry_item {
 	STAILQ_ENTRY(s3_retry_item) link;
 };
 
+#define S3_KEY_MAX 512
+
+struct s3_ctx;
+struct s3_chunk_io;
+
+struct s3_bs_channel {
+	struct s3_ctx          *ctx;
+	struct spdk_io_channel *cache_ch;
+};
+
+struct s3_chunk_io;
+struct s3_bs_io;
+struct s3_dest_fill_waiter;
+TAILQ_HEAD(s3_dest_fill_waiters, s3_dest_fill_waiter);
+
+struct s3_dest_fill_waiter {
+	struct s3_chunk_io        *cio;
+	struct s3_bs_io           *bs_io;
+	struct spdk_thread        *origin;
+	uint32_t                   offset;
+	uint32_t                   length;
+	TAILQ_ENTRY(s3_dest_fill_waiter) link;
+};
+
+struct s3_dest_fill {
+	struct s3_ctx            *ctx;
+	uint64_t                  chunk_index;
+	struct spdk_uuid          uuid;
+	uint32_t                  valid_bytes;
+	char                      key[S3_KEY_MAX];
+	void                     *buf;
+	/* A full-object waiter may lend its payload to the GET. Complete it only
+	 * after coalesced waiters have copied from that payload. */
+	struct s3_dest_fill_waiter *direct_waiter;
+	bool                      buf_owned;
+	bool                      token_held;
+	uint64_t                  bytes_read;
+	int                       status;
+	struct s3_dest_fill_waiters waiters;
+	TAILQ_ENTRY(s3_dest_fill) link;
+};
+
+TAILQ_HEAD(s3_dest_fills, s3_dest_fill);
+
 struct s3_ctx {
 	/* Must be the first member: blobstore gets &ctx->bs_dev, and we recover
 	 * ctx from pointer equality. */
@@ -145,6 +194,8 @@ struct s3_ctx {
 	uint32_t                 chunk_size;
 	uint32_t                 chunk_shift;
 	uint64_t                 capacity_bytes;
+	uint32_t                 cache_hot_bufs;
+	uint64_t                 writeback_capacity_bytes;
 
 	/* The thread that owns this bs_dev; used to verify I/O stays on it. */
 	struct spdk_thread      *owner_thread;
@@ -177,7 +228,13 @@ struct s3_ctx {
 	struct s3_wal *wal;
 
 	struct s3_overlay *overlay;
+	struct s3_writeback *writeback;
 	struct s3_flusher *flusher;
+	struct spdk_poller *flusher_resume_poller;
+	/* First post-ack WAL/overlay failure. FLUSH and drain must report it:
+	 * the acknowledged bytes remain recoverable from shm, but are not yet
+	 * durable enough for export or clean unload. */
+	int wal_writeback_error;
 
 	/* Local device, for the checkpoint path: it owns the super block that
 	 * records checkpoint_gen / checkpoint_lsn, and its super block is also
@@ -190,6 +247,9 @@ struct s3_ctx {
 	 * treats "no cache" and "miss" identically, so nothing here has to be
 	 * conditional beyond the null check itself. */
 	struct s3_cache *cache;
+	pthread_mutex_t read_fill_lock;
+	struct s3_dest_fills read_fills;
+	uint32_t dest_fills_inflight;
 
 	/* Registered only while teardown is waiting for a cache fill to land. See
 	 * s3_bs_dev_teardown(). */
@@ -208,6 +268,7 @@ struct s3_ctx {
 	 * way. Two things consult it -- ckpt_start() refuses to begin anything new,
 	 * and ckpt_finish() knows that a teardown is waiting for it. */
 	bool destroying;
+	bool teardown_wal_barrier_started;
 
 	uint64_t ckpt_gen;
 	uint64_t ckpt_lsn_pending;
@@ -238,12 +299,14 @@ struct s3_ctx {
 	struct spdk_poller *retry_poller;
 	STAILQ_HEAD(, s3_retry_item) retry_q;
 	uint32_t retry_count;
+	bool retry_active;
 
 	/* Fired once the context is fully released, so the caller knows when it may
 	 * close the journal and the local device. Needed because destroy() is
 	 * asynchronous on the WAL path. */
 	s3_bs_dev_cb destroy_cb;
 	void *destroy_arg;
+	int destroy_status;
 
 	/* Fired with the final chunk map, just before it is freed. See
 	 * s3_bs_dev_set_reap_cb(). */
@@ -253,11 +316,24 @@ struct s3_ctx {
 	/* Diagnostics */
 	uint64_t                 rmw_count;      /* writes that needed read-modify-write */
 	uint64_t                 zero_fill_count;/* zero-filled because the chunk was unallocated */
+	uint64_t                 dest_whole_gets;
+	uint64_t                 dest_coalesced_reads;
+	uint64_t                 dest_exact_fallbacks;
+	uint64_t                 dest_submit_cache_hits;
+	uint64_t                 dest_submit_cache_retries;
+	uint64_t                 dest_submit_fill_starts;
+	uint64_t                 dest_submit_fill_joins;
+	uint64_t                 dest_direct_gets;
+	uint64_t                 dest_direct_get_bytes;
 
 	/* WAL path counters */
-	uint64_t wal_writes;   /* writes acknowledged from the log */
+	uint64_t wal_writes;   /* write-back records made durable in the WAL */
 	uint64_t wal_retries;  /* writes parked by backpressure */
 	uint64_t overlay_hits; /* reads served without touching S3 */
+
+	/* Set only while a decouple (or similar) is ingesting export objects via
+	 * CopyObject. NULL means dest->copy is also NULL and CoW uses GET+write. */
+	struct s3_ingest *ingest;
 };
 
 /* Context for one bs_dev I/O.
@@ -274,43 +350,26 @@ struct s3_ctx {
  * (spdk/module/event/subsystems/nvmf/nvmf_tgt.c:226 creates one per core), which
  * is never the thread that created the lvstore.
  *
- * But s3_ctx and the chunk map are single-owner-thread with no locking, so the
- * work is bounced onto owner_thread and the completion is bounced back. Both
- * directions are mandatory:
+ * Most s3_ctx state is single-owner-thread, so the ordinary path is bounced
+ * onto owner_thread and the completion is bounced back. Both directions are
+ * mandatory there:
  *
- *   - forward, because ctx->inflight, the chunk map and the S3 client are all
- *     unsynchronized owner-thread state;
+ *   - forward, because ctx->inflight and most mutation paths are
+ *     unsynchronized owner-thread state. The synchronized one-chunk exception
+ *     below may submit an immutable GET through the thread-safe S3 client;
  *   - backward, because blobstore takes its request set from a per-channel free
  *     list and returns it with an unlocked TAILQ_INSERT_TAIL
  *     (spdk/lib/blob/request.c:66, per-channel req_mem in blobstore.c:3667), so
  *     completing on the wrong thread corrupts that list.
  *
- * Two message hops per I/O is negligible here: every I/O already costs an S3
- * round trip measured in milliseconds.
+ * The exception is a one-chunk read of a chunk with no overlay. Chunk-map,
+ * cache and destination-fill metadata synchronize that path internally. A
+ * cache hit completes on the submitting thread; a miss may join or start a
+ * whole-object GET there. A successful fill with only off-owner waiters
+ * publishes RAM and completes those waiters on the GET thread; disk writeback
+ * is a message to the cache owner. Owner still finishes fills that have to
+ * merge the overlay or retry through s3_bs_io_submit.
  */
-struct s3_bs_io {
-	struct s3_ctx                   *ctx;
-	struct spdk_bs_dev_cb_args      *cb_args;
-
-	/* Thread that submitted, and where the completion must be delivered. */
-	struct spdk_thread              *submit_thread;
-
-	/* Saved so the split loop can run later on the owner thread. */
-	void                            *payload;
-	uint64_t                         lba;
-	uint32_t                         lba_count;
-
-	/* Number of split sub-operations, plus the aggregation state. */
-	uint32_t                         num_pending;
-	int                              status;
-
-	/* Whether the submit phase has finished. Stops the first sub-operation
-	 * from completing the whole I/O while the split is still in progress. */
-	bool                             submit_done;
-
-	bool                             is_write;
-};
-
 /* One operation on a single chunk. */
 struct s3_chunk_io {
 	struct s3_bs_io         *bs_io;
@@ -343,6 +402,7 @@ struct s3_chunk_io {
 	/* the old object replaced by an overwrite, deleted on completion */
 	struct spdk_uuid         old_uuid;
 	bool                     has_old;
+	bool                     embedded;
 
 	/* Which object this GET is reading, and whether a 404 has already sent it
 	 * back for a second attempt.
@@ -378,7 +438,37 @@ struct s3_chunk_io {
 	bool                     cache_tried;
 };
 
-#define S3_KEY_MAX 512
+struct s3_bs_io {
+	struct s3_ctx                   *ctx;
+	struct spdk_bs_dev_cb_args      *cb_args;
+
+	/* Thread that submitted, and where the completion must be delivered. */
+	struct spdk_thread              *submit_thread;
+
+	/* Saved so the split loop can run later on the owner thread. */
+	void                            *payload;
+	uint64_t                         lba;
+	uint32_t                         lba_count;
+
+	/* Number of split sub-operations, plus the aggregation state. */
+	uint32_t                         num_pending;
+	int                              status;
+	int                              cache_status;
+	uint64_t                         cache_chunk_index;
+	struct spdk_uuid                 cache_uuid;
+
+	/* Whether the submit phase has finished. Stops the first sub-operation
+	 * from completing the whole I/O while the split is still in progress. */
+	bool                             submit_done;
+	bool                             submit_fill_tried;
+
+	bool                             is_write;
+
+	/* Embedded first chunk sub-operation, avoiding a second heap allocation
+	 * on the common single-chunk I/O path. */
+	struct s3_chunk_io               inline_cio;
+	bool                             inline_cio_used;
+};
 
 /* ==========================================================================
  * Helpers
@@ -406,6 +496,7 @@ s3_data_key(const struct s3_ctx *ctx, const struct spdk_uuid *uuid,
  * ========================================================================== */
 
 static int s3_retry_poll(void *arg);
+static void s3_retry_wake(struct s3_ctx *ctx);
 
 /* Park an operation and arrange for it to be retried.
  *
@@ -423,25 +514,54 @@ s3_retry_queue(struct s3_ctx *ctx, void (*retry_fn)(void *), void *arg)
 	item->retry_fn = retry_fn;
 	item->arg = arg;
 
-	STAILQ_INSERT_TAIL(&ctx->retry_q, item, link);
-	ctx->retry_count++;
-
 	if (!ctx->retry_poller) {
 		ctx->retry_poller = SPDK_POLLER_REGISTER(s3_retry_poll, ctx,
 							S3_RETRY_POLL_US);
+		if (!ctx->retry_poller) {
+			free(item);
+			return -ENOMEM;
+		}
 	}
+	STAILQ_INSERT_TAIL(&ctx->retry_q, item, link);
+	ctx->retry_count++;
 
 	return 0;
+}
+
+static int
+s3_retry_run(struct s3_ctx *ctx)
+{
+	struct s3_retry_item *item;
+	uint32_t budget, retried = 0;
+
+	if (ctx->retry_active || STAILQ_EMPTY(&ctx->retry_q)) {
+		return 0;
+	}
+
+	/* Snapshot the queue length. A failed retry requeues itself at the tail;
+	 * without this snapshot, QD=1 retries that same item 64 times in one poll
+	 * and a full ring burns hundreds of thousands of attempts per second. */
+	budget = spdk_min(ctx->retry_count, (uint32_t)S3_WAL_BATCH_MAX_OPS);
+	ctx->retry_active = true;
+	while (retried++ < budget &&
+	       (item = STAILQ_FIRST(&ctx->retry_q)) != NULL) {
+		STAILQ_REMOVE_HEAD(&ctx->retry_q, link);
+		assert(ctx->retry_count > 0);
+		ctx->retry_count--;
+		item->retry_fn(item->arg);
+		free(item);
+	}
+	ctx->retry_active = false;
+
+	return budget;
 }
 
 static int
 s3_retry_poll(void *arg)
 {
 	struct s3_ctx *ctx = arg;
-	struct s3_retry_item *item;
 
-	item = STAILQ_FIRST(&ctx->retry_q);
-	if (!item) {
+	if (STAILQ_EMPTY(&ctx->retry_q)) {
 		/* Unregistering the poller currently running is supported and is
 		 * the point: an lvstore that is not backpressured should not be
 		 * polled at all. */
@@ -449,16 +569,27 @@ s3_retry_poll(void *arg)
 		return SPDK_POLLER_IDLE;
 	}
 
-	/* One per tick. Retrying the whole queue at once would just re-park most
-	 * of it, and this way the ordering between parked writes is preserved. */
-	STAILQ_REMOVE_HEAD(&ctx->retry_q, link);
-	assert(ctx->retry_count > 0);
-	ctx->retry_count--;
-
-	item->retry_fn(item->arg);
-	free(item);
-
+	s3_retry_run(ctx);
 	return SPDK_POLLER_BUSY;
+}
+
+static void
+s3_retry_wake(struct s3_ctx *ctx)
+{
+	if (ctx->retry_count != 0 && !ctx->retry_active) {
+		s3_retry_run(ctx);
+	}
+}
+
+static uint64_t
+s3_writeback_reclaim_and_wake(struct s3_ctx *ctx)
+{
+	uint64_t reclaimed = s3_writeback_reclaim(ctx->writeback);
+
+	if (reclaimed != 0) {
+		s3_retry_wake(ctx);
+	}
+	return reclaimed;
 }
 
 /* Overlay whatever has not reached S3 yet on top of the base data just read.
@@ -555,7 +686,10 @@ s3_bs_io_put(struct s3_bs_io *bs_io)
  * ========================================================================== */
 
 static int s3_chunk_read_submit(struct s3_chunk_io *cio);
+static void s3_bs_io_submit(void *arg);
+static void s3_bs_submit_fill_finish(void *arg);
 static int s3_chunk_write_submit(struct s3_chunk_io *cio);
+static void s3_chunk_read_done(void *cb_arg, uint64_t bytes_read, int status);
 
 /* Is a 404 worth one more read?
  *
@@ -607,6 +741,458 @@ s3_chunk_read_should_reread(struct s3_chunk_io *cio)
 	SPDK_NOTICELOG("Chunk %" PRIu64 " was overwritten while being read (%s -> "
 		       "%s); rereading\n", cio->chunk_index, read_str, now_str);
 	return true;
+}
+
+static int
+s3_chunk_exact_read_submit(struct s3_chunk_io *cio)
+{
+	struct s3_ctx *ctx = cio->bs_io->ctx;
+	uint32_t want;
+	char key[S3_KEY_MAX];
+
+	want = (uint32_t)spdk_min(cio->length,
+				   cio->read_valid_bytes - cio->offset_in_chunk);
+	s3_data_key(ctx, &cio->read_uuid, key, sizeof(key));
+	return s3_get_range(ctx->client, key, cio->offset_in_chunk, want,
+			    cio->user_buf, s3_chunk_read_done, cio);
+}
+
+static bool
+s3_dest_fill_waiter_covers_object(const struct s3_dest_fill_waiter *waiter,
+				  uint32_t valid_bytes)
+{
+	return waiter->offset == 0 && waiter->length >= valid_bytes;
+}
+
+static void *
+s3_dest_fill_waiter_payload(const struct s3_dest_fill_waiter *waiter)
+{
+	return waiter->bs_io ? waiter->bs_io->payload : waiter->cio->user_buf;
+}
+
+static struct s3_dest_fill_waiter *
+s3_dest_fill_pick_direct_waiter(struct s3_dest_fill *fill)
+{
+	struct s3_dest_fill_waiter *waiter;
+
+	TAILQ_FOREACH(waiter, &fill->waiters, link) {
+		if (s3_dest_fill_waiter_covers_object(waiter, fill->valid_bytes)) {
+			return waiter;
+		}
+	}
+	return NULL;
+}
+
+static void
+s3_dest_fill_finish(void *arg)
+{
+	struct s3_dest_fill *fill = arg;
+	struct s3_ctx *ctx = fill->ctx;
+	struct s3_dest_fill_waiters waiters;
+	struct s3_dest_fill_waiter *waiter;
+	struct s3_dest_fill_waiter *direct_waiter;
+	bool exact_fallback = false;
+	bool need_cache = false;
+
+	TAILQ_INIT(&waiters);
+	pthread_mutex_lock(&ctx->read_fill_lock);
+	/* Unlinked in s3_dest_fill_done. Keep dest_fills_inflight until after
+	 * overlay apply and populate so destroy cannot race this finish. */
+	direct_waiter = fill->direct_waiter;
+	while ((waiter = TAILQ_FIRST(&fill->waiters)) != NULL) {
+		TAILQ_REMOVE(&fill->waiters, waiter, link);
+		if (waiter != direct_waiter) {
+			TAILQ_INSERT_TAIL(&waiters, waiter, link);
+		}
+	}
+	/* A completion may release its payload. Since that payload is also this
+	 * fill's immutable source, all copies must finish before it completes. */
+	if (direct_waiter) {
+		TAILQ_INSERT_TAIL(&waiters, direct_waiter, link);
+	}
+	TAILQ_FOREACH(waiter, &waiters, link) {
+		if (!s3_dest_fill_waiter_covers_object(waiter, fill->valid_bytes)) {
+			need_cache = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&ctx->read_fill_lock);
+
+	if (fill->status == 0 && fill->bytes_read != fill->valid_bytes) {
+		SPDK_ERRLOG("Short whole-object read of chunk %" PRIu64 ": asked for "
+			    "%u byte(s), got %" PRIu64 "\n",
+			    fill->chunk_index, fill->valid_bytes, fill->bytes_read);
+		fill->status = -EIO;
+		exact_fallback = true;
+	} else if (fill->status != 0 && fill->status != -ENOENT) {
+		exact_fallback = true;
+	}
+	if (exact_fallback) {
+		__atomic_fetch_add(&ctx->dest_exact_fallbacks, 1,
+				   __ATOMIC_RELAXED);
+	}
+	if (fill->status == 0 &&
+	    !__atomic_load_n(&ctx->destroying, __ATOMIC_ACQUIRE)) {
+		if (direct_waiter) {
+			__atomic_fetch_add(&ctx->dest_direct_gets, 1,
+					   __ATOMIC_RELAXED);
+			__atomic_fetch_add(&ctx->dest_direct_get_bytes,
+					   fill->bytes_read, __ATOMIC_RELAXED);
+		}
+		/* A lent user buffer is still owned here. Populate before that
+		 * waiter completes. An owned bounce stays valid after waiters
+		 * finish, so that memcpy stays off their completion. Whole-object
+		 * waiters already hold the bytes: skip the cache write. */
+		if (need_cache && !fill->buf_owned) {
+			s3_cache_populate(ctx->cache, fill->chunk_index,
+					  &fill->uuid, 0, fill->buf,
+					  fill->valid_bytes, fill->valid_bytes);
+		}
+	}
+
+	while ((waiter = TAILQ_FIRST(&waiters)) != NULL) {
+		struct s3_chunk_io *cio = waiter->cio;
+		int waiter_status = fill->status;
+		int rc;
+
+		TAILQ_REMOVE(&waiters, waiter, link);
+		assert((waiter->cio != NULL) != (waiter->bs_io != NULL));
+		if (!cio) {
+			struct s3_bs_io *bs_io = waiter->bs_io;
+
+			if (waiter_status == 0) {
+				uint32_t copy_len = 0;
+
+				if (waiter->offset < fill->valid_bytes) {
+					copy_len = spdk_min(waiter->length,
+							    fill->valid_bytes -
+							    waiter->offset);
+				}
+				if (waiter != direct_waiter) {
+					memcpy(bs_io->payload,
+					       (uint8_t *)fill->buf + waiter->offset,
+					       copy_len);
+					if (copy_len < waiter->length) {
+						memset((uint8_t *)bs_io->payload + copy_len,
+						       0, waiter->length - copy_len);
+					}
+				}
+				rc = spdk_thread_send_msg(waiter->origin,
+							  s3_bs_submit_fill_finish,
+							  bs_io);
+				if (rc != 0) {
+					/* Last resort: the origin has stopped accepting
+					 * messages. Losing the completion hangs blobstore
+					 * forever; finish on this SPDK thread instead. */
+					SPDK_ERRLOG("dest fill completion bounce failed: %s; "
+						    "delivering locally\n",
+						    spdk_strerror(-rc));
+					s3_bs_submit_fill_finish(bs_io);
+				}
+			} else {
+				if (ctx->owner_thread == NULL ||
+				    ctx->owner_thread == spdk_get_thread()) {
+					s3_bs_io_submit(bs_io);
+				} else {
+					rc = spdk_thread_send_msg(ctx->owner_thread,
+								  s3_bs_io_submit,
+								  bs_io);
+					if (rc != 0) {
+						struct spdk_bs_dev_cb_args *cb_args =
+							bs_io->cb_args;
+
+						free(bs_io);
+						cb_args->cb_fn(cb_args->channel,
+							       cb_args->cb_arg, rc);
+					}
+				}
+			}
+			free(waiter);
+			continue;
+		}
+		if (waiter_status == -ENOENT &&
+		    s3_chunk_read_should_reread(cio)) {
+			cio->reread = true;
+			waiter_status = s3_chunk_read_submit(cio);
+			if (waiter_status == 0) {
+				free(waiter);
+				continue;
+			}
+		}
+		if (exact_fallback) {
+			waiter_status = s3_chunk_exact_read_submit(cio);
+			if (waiter_status == 0) {
+				free(waiter);
+				continue;
+			}
+		}
+		if (waiter_status == 0) {
+			uint32_t copy_len = 0;
+
+			if (cio->offset_in_chunk < fill->valid_bytes) {
+				copy_len = spdk_min(cio->length,
+						    fill->valid_bytes -
+						    cio->offset_in_chunk);
+				if (waiter != direct_waiter) {
+					memcpy(cio->user_buf,
+					       (uint8_t *)fill->buf +
+					       cio->offset_in_chunk,
+					       copy_len);
+				}
+			}
+			if (copy_len < cio->length) {
+				memset((uint8_t *)cio->user_buf + copy_len, 0,
+				       cio->length - copy_len);
+			}
+			s3_read_apply_overlay(cio);
+		}
+		s3_chunk_io_finish(cio, waiter_status);
+		free(waiter);
+	}
+
+	if (fill->buf_owned) {
+		if (need_cache && fill->status == 0 &&
+		    !__atomic_load_n(&ctx->destroying, __ATOMIC_ACQUIRE)) {
+			s3_cache_populate(ctx->cache, fill->chunk_index,
+					  &fill->uuid, 0, fill->buf,
+					  fill->valid_bytes, fill->valid_bytes);
+		}
+		free(fill->buf);
+	}
+
+	pthread_mutex_lock(&ctx->read_fill_lock);
+	assert(ctx->dest_fills_inflight > 0);
+	ctx->dest_fills_inflight--;
+	pthread_mutex_unlock(&ctx->read_fill_lock);
+	free(fill);
+}
+
+/* The GET completion could not return to the owner thread. Do not call the
+ * ordinary finish path here: successful cio waiters need owner-thread overlay
+ * access, and retries also belong there. Fail every waiter, then retire the fill
+ * so teardown cannot wait forever on a completion that can no longer arrive. */
+static void
+s3_dest_fill_abort_bounce(struct s3_dest_fill *fill, int status)
+{
+	struct s3_ctx *ctx = fill->ctx;
+	struct s3_dest_fill_waiter *waiter;
+
+	assert(status != 0);
+	while ((waiter = TAILQ_FIRST(&fill->waiters)) != NULL) {
+		TAILQ_REMOVE(&fill->waiters, waiter, link);
+		if (waiter->cio) {
+			s3_chunk_io_finish(waiter->cio, status);
+		} else {
+			struct spdk_bs_dev_cb_args *cb_args = waiter->bs_io->cb_args;
+
+			free(waiter->bs_io);
+			cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, status);
+		}
+		free(waiter);
+	}
+	if (fill->buf_owned) {
+		free(fill->buf);
+	}
+
+	pthread_mutex_lock(&ctx->read_fill_lock);
+	assert(ctx->dest_fills_inflight > 0);
+	ctx->dest_fills_inflight--;
+	pthread_mutex_unlock(&ctx->read_fill_lock);
+	free(fill);
+}
+
+static void
+s3_dest_fill_done(void *cb_arg, uint64_t bytes_read, int status)
+{
+	struct s3_dest_fill *fill = cb_arg;
+	struct s3_ctx *ctx = fill->ctx;
+	struct s3_dest_fill_waiter *waiter;
+	bool bounce_owner = false;
+	int rc;
+
+	fill->bytes_read = bytes_read;
+	fill->status = status;
+	/* -ENOENT is the flusher-overwrite 404 documented above (the "Which object
+	 * this GET is reading" block): finish treats it as a mapping reread, not a
+	 * failed GET. ERRLOG here would fire on every such race at the level
+	 * operators filter for faults. */
+	if (status != 0 && status != -ENOENT) {
+		char uuid_str[SPDK_UUID_STRING_LEN];
+
+		spdk_uuid_fmt_lower(uuid_str, sizeof(uuid_str), &fill->uuid);
+		SPDK_ERRLOG("dest fill chunk %" PRIu64 " uuid %s failed: %s "
+			    "(key=%s)\n",
+			    fill->chunk_index, uuid_str,
+			    spdk_strerror(-status), fill->key);
+	}
+	if (fill->token_held) {
+		fill->token_held = false;
+		s3_whole_get_token_release();
+	}
+
+	pthread_mutex_lock(&ctx->read_fill_lock);
+	/* Unlink before inspecting waiters. Leaving the fill on read_fills until
+	 * finish lets a cio join after this scan, then s3_dest_fill_finish would
+	 * apply overlay on the GET thread. dest_fills_inflight is dropped in
+	 * finish, not here. */
+	TAILQ_REMOVE(&ctx->read_fills, fill, link);
+	if (fill->status != 0) {
+		bounce_owner = true;
+	} else {
+		TAILQ_FOREACH(waiter, &fill->waiters, link) {
+			if (waiter->cio != NULL) {
+				bounce_owner = true;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&ctx->read_fill_lock);
+
+	if (bounce_owner && ctx->owner_thread != NULL &&
+	    ctx->owner_thread != spdk_get_thread()) {
+		rc = spdk_thread_send_msg(ctx->owner_thread,
+					  s3_dest_fill_finish, fill);
+		if (rc != 0) {
+			SPDK_ERRLOG("dest fill owner bounce failed: %s; "
+				    "failing the fill locally\n", spdk_strerror(-rc));
+			s3_dest_fill_abort_bounce(fill, rc);
+		}
+		return;
+	}
+	s3_dest_fill_finish(fill);
+}
+
+static void
+s3_dest_fill_token_granted(void *arg)
+{
+	struct s3_dest_fill *fill = arg;
+	struct s3_dest_fill_waiter *waiter;
+	int rc;
+
+	fill->token_held = true;
+	/* Prefer any waiter that already has room for the whole object, not
+	 * necessarily the first. A 4K demand can start the fill; a later 1 MiB
+	 * restore of the same chunk should still skip the bounce copy. */
+	pthread_mutex_lock(&fill->ctx->read_fill_lock);
+	waiter = s3_dest_fill_pick_direct_waiter(fill);
+	if (waiter) {
+		fill->direct_waiter = waiter;
+		fill->buf = s3_dest_fill_waiter_payload(waiter);
+	}
+	pthread_mutex_unlock(&fill->ctx->read_fill_lock);
+
+	if (!fill->buf) {
+		fill->buf = malloc(fill->valid_bytes);
+		fill->buf_owned = fill->buf != NULL;
+	}
+	if (!fill->buf) {
+		s3_dest_fill_done(fill, 0, -ENOMEM);
+		return;
+	}
+	__atomic_fetch_add(&fill->ctx->dest_whole_gets, 1, __ATOMIC_RELAXED);
+	rc = s3_get_range(fill->ctx->client, fill->key, 0, fill->valid_bytes,
+			  fill->buf, s3_dest_fill_done, fill);
+	if (rc != 0) {
+		s3_dest_fill_done(fill, 0, rc);
+	}
+}
+
+static void
+s3_dest_fill_token_cancelled(void *arg, int status)
+{
+	s3_dest_fill_done(arg, 0, status);
+}
+
+static int
+s3_dest_fill_submit_waiter(struct s3_ctx *ctx,
+			   struct s3_dest_fill_waiter *waiter,
+			   uint64_t chunk_index, const struct spdk_uuid *uuid,
+			   uint32_t valid_bytes, const char *key)
+{
+	struct s3_dest_fill *fill;
+	int rc;
+
+	pthread_mutex_lock(&ctx->read_fill_lock);
+	if (__atomic_load_n(&ctx->destroying, __ATOMIC_ACQUIRE)) {
+		pthread_mutex_unlock(&ctx->read_fill_lock);
+		return -ESHUTDOWN;
+	}
+	TAILQ_FOREACH(fill, &ctx->read_fills, link) {
+		if (fill->chunk_index == chunk_index &&
+		    spdk_uuid_compare(&fill->uuid, uuid) == 0) {
+			TAILQ_INSERT_TAIL(&fill->waiters, waiter, link);
+			__atomic_fetch_add(&ctx->dest_coalesced_reads, 1,
+					   __ATOMIC_RELAXED);
+			if (waiter->bs_io) {
+				__atomic_fetch_add(&ctx->dest_submit_fill_joins, 1,
+						   __ATOMIC_RELAXED);
+			}
+			pthread_mutex_unlock(&ctx->read_fill_lock);
+			return 0;
+		}
+	}
+	if (ctx->dest_fills_inflight >= S3_DEST_FILL_MAX_INFLIGHT) {
+		pthread_mutex_unlock(&ctx->read_fill_lock);
+		return -EAGAIN;
+	}
+
+	fill = calloc(1, sizeof(*fill));
+	if (!fill) {
+		pthread_mutex_unlock(&ctx->read_fill_lock);
+		return -ENOMEM;
+	}
+	fill->ctx = ctx;
+	fill->chunk_index = chunk_index;
+	spdk_uuid_copy(&fill->uuid, uuid);
+	fill->valid_bytes = valid_bytes;
+	snprintf(fill->key, sizeof(fill->key), "%s", key);
+	TAILQ_INIT(&fill->waiters);
+	TAILQ_INSERT_TAIL(&fill->waiters, waiter, link);
+	TAILQ_INSERT_TAIL(&ctx->read_fills, fill, link);
+	ctx->dest_fills_inflight++;
+	if (waiter->bs_io) {
+		__atomic_fetch_add(&ctx->dest_submit_fill_starts, 1,
+				   __ATOMIC_RELAXED);
+	}
+	pthread_mutex_unlock(&ctx->read_fill_lock);
+
+	rc = s3_whole_get_token_acquire_ex(false, s3_dest_fill_token_granted,
+					   s3_dest_fill_token_cancelled, fill);
+	if (rc < 0) {
+		/* The fill was already published, so other threads may have joined
+		 * while token admission allocated. Fail the shared operation rather
+		 * than trying to retract only its first waiter. */
+		s3_dest_fill_done(fill, 0, rc);
+		return 0;
+	}
+	if (rc == 1) {
+		s3_dest_fill_token_granted(fill);
+		return 0;
+	}
+	return 0;
+}
+
+static int
+s3_dest_fill_submit(struct s3_chunk_io *cio, const char *key)
+{
+	struct s3_dest_fill_waiter *waiter;
+	int rc;
+
+	waiter = calloc(1, sizeof(*waiter));
+	if (!waiter) {
+		return -ENOMEM;
+	}
+	waiter->cio = cio;
+	waiter->origin = spdk_get_thread();
+	waiter->offset = cio->offset_in_chunk;
+	waiter->length = cio->length;
+	rc = s3_dest_fill_submit_waiter(cio->bs_io->ctx, waiter,
+					 cio->chunk_index, &cio->read_uuid,
+					 cio->read_valid_bytes, key);
+	if (rc != 0) {
+		free(waiter);
+	}
+	return rc;
 }
 
 static void
@@ -742,7 +1328,6 @@ s3_chunk_read_submit(struct s3_chunk_io *cio)
 		s3_chunk_io_finish(cio, 0);
 		return 0;
 	}
-
 	rc = s3_chunk_map_lookup(ctx->chunk_map, cio->chunk_index, &uuid,
 				 &valid_bytes);
 	if (rc == -ENOENT) {
@@ -786,13 +1371,19 @@ s3_chunk_read_submit(struct s3_chunk_io *cio)
 	 * is tagged with the uuid this read resolved from the chunk map, and a uuid
 	 * names immutable bytes.
 	 *
-	 * The reread path skips the cache: a reread happens because the object went
-	 * away underneath, and the point of it is to consult S3 again. */
+	 * The reread path skips the cache and the whole-object fill: a reread
+	 * happens because the object went away underneath, and the point of it
+	 * is a cheap exact-range GET of S3 rather than another coalesced fill.
+	 */
 	if (ctx->cache && !cio->cache_tried && !cio->reread) {
+		uint64_t chunk_index = cio->chunk_index;
+		uint32_t offset = cio->offset_in_chunk;
+		uint32_t length = cio->length;
+
 		cio->cache_tried = true;
 
-		rc = s3_cache_read(ctx->cache, cio->chunk_index, &uuid,
-				   cio->offset_in_chunk, cio->length,
+		rc = s3_cache_read(ctx->cache, chunk_index, &uuid,
+				   offset, length,
 				   cio->user_buf, s3_chunk_cache_read_done, cio);
 		if (rc == 0) {
 			return 0;
@@ -801,72 +1392,230 @@ s3_chunk_read_submit(struct s3_chunk_io *cio)
 		 * fall through to the GET. s3_cache_read promises nothing else. */
 	}
 
-	/* Read straight into user_buf: the range GET returns exactly the wanted
-	 * range, no staging needed. It may read short only when zero-filling past
-	 * the object's end is required, which s3_chunk_read_done handles. */
-	uint32_t want = (uint32_t)spdk_min(cio->length,
-					   valid_bytes - cio->offset_in_chunk);
-
-	rc = s3_get_range(ctx->client, key, cio->offset_in_chunk, want,
-			  cio->user_buf, s3_chunk_read_done, cio);
-	if (rc != 0) {
-		return rc;
+	/* A cache miss fetches the immutable object once, shares that GET with
+	 * concurrent readers, and populates the full local-cache slot.  Rereads
+	 * skip this lane (see above). Allocation or admission bookkeeping failure
+	 * is only a cache optimisation failure; preserve forward progress through
+	 * the exact-range path below. */
+	if (ctx->cache && !cio->chunk_buf && !cio->reread) {
+		if (!cio->bs_io->submit_fill_tried) {
+			rc = s3_dest_fill_submit(cio, key);
+			if (rc == 0) {
+				return 0;
+			}
+		}
+		__atomic_fetch_add(&ctx->dest_exact_fallbacks, 1,
+				   __ATOMIC_RELAXED);
 	}
-	/* the want < length remainder is zero-filled in the completion */
 
-	return 0;
+	/* Exact range is the no-cache path and the bounded fallback when whole
+	 * staging cannot be admitted.  Its short tail is zero-filled by the
+	 * completion. */
+	return s3_chunk_exact_read_submit(cio);
 }
 
 /* ==========================================================================
- * Write path with a WAL: append to the log and acknowledge from there
+ * Write path with a WAL: publish to shared memory, drain the WAL in background
  * ========================================================================== */
 
 static void s3_chunk_wal_submit(void *arg);
+static void s3_writeback_wal_submit(void *arg);
 
-/* The log entry is durable. Make it visible to reads, then acknowledge.
- *
- * The order matters: acknowledging first would leave a window in which a read of
- * an already acknowledged write still returns the old S3 object. */
+struct s3_writeback_wal_op {
+	struct s3_ctx      *ctx;
+	struct s3_chunk_io *cio; /* non-NULL until the write is acknowledged */
+	struct s3_writeback_record record;
+	struct s3_overlay_write_reservation *reservation;
+	uint64_t            writeback_seq;
+	uint64_t            wal_seq;
+	uint64_t            lba;
+	uint64_t            chunk_index;
+	uint32_t            nblocks;
+	const void         *payload;
+	void               *zero_buf;
+	bool                submitting;
+	bool                completion_seen;
+	bool                overlay_published;
+	bool                wal_finished;
+	uint32_t            overlay_refs;
+	int                 completion_status;
+	int                 overlay_error;
+};
+
 static void
-s3_chunk_wal_done(void *cb_arg, int status)
+s3_writeback_op_maybe_release(struct s3_writeback_wal_op *op)
 {
-	struct s3_chunk_io *cio = cb_arg;
-	struct s3_ctx *ctx = cio->bs_io->ctx;
 	int rc;
 
-	if (status == -EAGAIN) {
-		/* Backpressure is a retry signal, not a failure (W5). */
-		ctx->wal_retries++;
-		s3_flusher_kick(ctx->flusher);
-		if (s3_retry_queue(ctx, s3_chunk_wal_submit, cio) == 0) {
-			return;
+	if (op->submitting || !op->wal_finished || op->overlay_refs != 0) {
+		return;
+	}
+	if (op->completion_status == 0 && op->overlay_published) {
+		rc = s3_writeback_mark_record_complete(op->ctx->writeback,
+						      &op->record, 0);
+		if (rc != 0 && rc != -EALREADY) {
+			SPDK_ERRLOG("Failed to complete write-back record %" PRIu64
+				    ": %d\n", op->writeback_seq, rc);
 		}
-		s3_chunk_io_finish(cio, -ENOMEM);
-		return;
+		(void)s3_writeback_reclaim_and_wake(op->ctx);
 	}
-	if (status != 0) {
-		s3_chunk_io_finish(cio, status);
-		return;
-	}
+	free(op->zero_buf);
+	free(op);
+}
 
-	rc = s3_overlay_write(ctx->overlay, cio->lba, cio->nblocks,
-			      cio->user_buf, cio->wal_seq);
+static void
+s3_writeback_overlay_release(void *cb_arg)
+{
+	struct s3_writeback_wal_op *op = cb_arg;
+
+	assert(op->overlay_refs > 0);
+	op->overlay_refs--;
+	s3_writeback_op_maybe_release(op);
+}
+
+static int
+s3_writeback_overlay_publish_recovered(
+	struct s3_ctx *ctx, const struct s3_writeback_record *record,
+	uint64_t wal_seq)
+{
+	struct s3_writeback_wal_op *op;
+	int rc;
+
+	op = calloc(1, sizeof(*op));
+	if (!op) {
+		return -ENOMEM;
+	}
+	op->ctx = ctx;
+	op->record = *record;
+	op->writeback_seq = record->seq;
+	op->wal_seq = wal_seq;
+	op->lba = record->lba;
+	op->chunk_index = record->chunk_index;
+	op->nblocks = record->nblocks;
+	op->payload = record->payload;
+	op->wal_finished = true;
+	op->completion_status = 0;
+	op->overlay_refs = record->nblocks;
+
+	op->submitting = true;
+	rc = s3_overlay_write_durable_ref(
+		ctx->overlay, record->lba, record->nblocks,
+		record->payload, wal_seq,
+		s3_writeback_overlay_release, op);
+	op->submitting = false;
 	if (rc != 0) {
-		/* The entry is already durable, so replay will bring this write
-		 * back even though blobstore is about to be told it failed.
-		 * Reporting the failure is still the right call: claiming success
-		 * for data that reads cannot see would be silent corruption. */
-		SPDK_ERRLOG("Failed to record chunk %" PRIu64 " in the overlay: "
-			    "%d (the write is in the log but not yet visible)\n",
-			    cio->chunk_index, rc);
+		free(op);
+		return rc;
+	}
+	op->overlay_published = true;
+	s3_writeback_op_maybe_release(op);
+	return 0;
+}
+
+static void
+s3_writeback_record_discard(struct s3_writeback_wal_op *op, int status)
+{
+	int rc;
+
+	rc = s3_writeback_mark_record_complete(op->ctx->writeback, &op->record,
+						status);
+	if (rc != 0 && rc != -EALREADY) {
+		SPDK_ERRLOG("Failed to retire unacknowledged write-back record %"
+			    PRIu64 ": %d\n", op->writeback_seq, rc);
+	}
+	(void)s3_writeback_reclaim_and_wake(op->ctx);
+}
+
+/* Bind a shm record to an overlay sequence without writing the payload to
+ * the disk log.  Sequences already stored in the record (a previous process
+ * assigned one) are kept so replay order does not change. */
+static int
+s3_writeback_assign_seq(struct s3_ctx *ctx, struct s3_writeback_record *record,
+			uint64_t *seq)
+{
+	int rc;
+
+	if (!ctx->wal || !seq) {
+		return -EINVAL;
+	}
+	if (record->wal_seq == 0) {
+		*seq = s3_wal_alloc_mem_seq(ctx->wal);
+		if (*seq == 0) {
+			return -EINVAL;
+		}
+		rc = s3_writeback_set_wal_seq(ctx->writeback, record, *seq);
+		if (rc != 0) {
+			return rc;
+		}
+		record->wal_seq = *seq;
+		return 0;
+	}
+	s3_wal_note_mem_seq(ctx->wal, record->wal_seq);
+	*seq = record->wal_seq;
+	return 0;
+}
+
+/* Submit a record that already owns its payload in shared memory.
+ *
+ * The disk WAL is not appended.  shm is the crash record; the chunk becomes
+ * flushable as soon as it is visible in the overlay. */
+static void
+s3_writeback_wal_submit(void *arg)
+{
+	struct s3_writeback_wal_op *op = arg;
+	struct s3_ctx *ctx = op->ctx;
+	struct s3_chunk_io *cio;
+	uint64_t writeback_seq;
+	int rc;
+
+	rc = s3_writeback_assign_seq(ctx, &op->record, &op->wal_seq);
+	if (rc != 0) {
+		cio = op->cio;
+		if (__atomic_load_n(&ctx->wal_writeback_error,
+				    __ATOMIC_RELAXED) == 0) {
+			__atomic_store_n(&ctx->wal_writeback_error, rc,
+					 __ATOMIC_RELEASE);
+		}
+		SPDK_ERRLOG("Failed to bind write-back record %" PRIu64
+			    ": %d\n", op->writeback_seq, rc);
+		s3_writeback_record_discard(op, rc);
+		free(op);
 		s3_chunk_io_finish(cio, rc);
 		return;
 	}
 
-	ctx->wal_writes++;
+	op->overlay_refs = op->nblocks;
+	op->submitting = true;
+	rc = s3_overlay_write_durable_ref(
+		ctx->overlay, op->lba, op->nblocks, op->payload, op->wal_seq,
+		s3_writeback_overlay_release, op);
+	op->submitting = false;
+	if (rc != 0) {
+		cio = op->cio;
+		writeback_seq = op->writeback_seq;
+		op->cio = NULL;
+		s3_writeback_record_discard(op, rc);
+		free(op);
+		if (rc == -EBUSY) {
+			ctx->wal_retries++;
+			if (s3_retry_queue(ctx, s3_chunk_wal_submit, cio) == 0) {
+				return;
+			}
+			rc = -ENOMEM;
+		}
+		SPDK_ERRLOG("Failed to publish write-back record %" PRIu64
+			    " in the overlay: %d\n", writeback_seq, rc);
+		s3_chunk_io_finish(cio, rc);
+		return;
+	}
+	op->overlay_published = true;
+	op->wal_finished = true;
 	s3_flusher_kick(ctx->flusher);
 
+	cio = op->cio;
+	op->cio = NULL;
 	s3_chunk_io_finish(cio, 0);
+	s3_writeback_op_maybe_release(op);
 }
 
 /* Submit one slice to the log.
@@ -878,10 +1627,25 @@ s3_chunk_wal_submit(void *arg)
 {
 	struct s3_chunk_io *cio = arg;
 	struct s3_ctx *ctx = cio->bs_io->ctx;
+	struct s3_writeback_wal_op *op;
+	uint64_t writeback_seq;
+	int rc;
 
 	/* The overlay holds every acknowledged write until the flusher gets to
 	 * it, so it needs a cap of its own -- the WAL's high-water mark bounds
 	 * log space, not RAM. */
+	if (__atomic_load_n(&ctx->wal_writeback_error, __ATOMIC_ACQUIRE) != 0) {
+		s3_chunk_io_finish(cio, __atomic_load_n(&ctx->wal_writeback_error,
+						      __ATOMIC_RELAXED));
+		return;
+	}
+	if (ctx->retry_count != 0 && !ctx->retry_active) {
+		if (s3_retry_queue(ctx, s3_chunk_wal_submit, cio) == 0) {
+			return;
+		}
+		s3_chunk_io_finish(cio, -ENOMEM);
+		return;
+	}
 	if (s3_overlay_is_full(ctx->overlay)) {
 		ctx->wal_retries++;
 		s3_flusher_kick(ctx->flusher);
@@ -892,9 +1656,39 @@ s3_chunk_wal_submit(void *arg)
 		return;
 	}
 
-	s3_wal_append_write(ctx->wal, cio->lba, cio->nblocks, cio->user_buf,
-			    cio->chunk_index, &cio->wal_seq,
-			    s3_chunk_wal_done, cio);
+	op = calloc(1, sizeof(*op));
+	if (!op) {
+		s3_chunk_io_finish(cio, -ENOMEM);
+		return;
+	}
+	op->ctx = ctx;
+
+	rc = s3_writeback_publish(ctx->writeback, S3_WRITEBACK_WRITE,
+				  cio->lba, cio->nblocks, cio->user_buf,
+				  cio->length, cio->chunk_index, &writeback_seq,
+				  &op->record);
+	if (rc == -ENOSPC) {
+		free(op);
+		ctx->wal_retries++;
+		s3_flusher_kick(ctx->flusher);
+		if (s3_retry_queue(ctx, s3_chunk_wal_submit, cio) == 0) {
+			return;
+		}
+		s3_chunk_io_finish(cio, -ENOMEM);
+		return;
+	}
+	if (rc != 0) {
+		free(op);
+		s3_chunk_io_finish(cio, rc);
+		return;
+	}
+	op->cio = cio;
+	op->writeback_seq = writeback_seq;
+	op->lba = cio->lba;
+	op->chunk_index = cio->chunk_index;
+	op->nblocks = cio->nblocks;
+	op->payload = op->record.payload;
+	s3_writeback_wal_submit(op);
 }
 
 /* ==========================================================================
@@ -905,6 +1699,8 @@ static void
 s3_chunk_old_deleted(void *cb_arg, int status)
 {
 	struct s3_chunk_io *cio = cb_arg;
+	struct s3_bs_io *bs_io = cio->bs_io;
+	bool embedded = cio->embedded;
 
 	if (status != 0) {
 		/* A failed delete of the old object does not affect the
@@ -915,9 +1711,11 @@ s3_chunk_old_deleted(void *cb_arg, int status)
 			     "(leaked, GC will collect)\n", status);
 	}
 
-	s3_bs_io_put(cio->bs_io);
 	free(cio->chunk_buf);
-	free(cio);
+	if (!embedded) {
+		free(cio);
+	}
+	s3_bs_io_put(bs_io);
 }
 
 /* The mapping is durable: delete the object it superseded.
@@ -1124,12 +1922,33 @@ s3_chunk_io_finish(struct s3_chunk_io *cio, int status)
 {
 	struct s3_bs_io *bs_io = cio->bs_io;
 
+	if (status != 0) {
+		struct s3_ctx *ctx = bs_io->ctx;
+		uint32_t covered = 0;
+
+		/* overlay is owner-thread state, and this runs on the abort path too
+		 * (see s3_dest_fill_abort_bounce), which is off-owner by construction.
+		 * s3_overlay_covered_count() walks c->blocks[], which the owner may free
+		 * after storing NULL, so it must not be read from another thread. The
+		 * count is a diagnostic; skip it rather than reach into the overlay. */
+		if (ctx->overlay && ctx->owner_thread == spdk_get_thread()) {
+			covered = s3_overlay_covered_count(ctx->overlay, cio->lba,
+							   cio->nblocks);
+		}
+		SPDK_ERRLOG("chunk I/O failed: lba=%" PRIu64 " nblocks=%u "
+			    "chunk=%" PRIu64 " status=%s overlay_covered=%u/%u\n",
+			    cio->lba, cio->nblocks, cio->chunk_index,
+			    spdk_strerror(-status), covered, cio->nblocks);
+	}
+
 	if (status != 0 && bs_io->status == 0) {
 		bs_io->status = status;
 	}
 
 	free(cio->chunk_buf);
-	free(cio);
+	if (!cio->embedded) {
+		free(cio);
+	}
 
 	s3_bs_io_put(bs_io);
 }
@@ -1175,21 +1994,19 @@ s3_bs_io_submit(void *arg)
 		this_len = (uint32_t)spdk_min(remaining_bytes,
 					      ctx->chunk_size - offset_in_chunk);
 
-		/* A slice also has to fit one log entry. A chunk-sized write does
-		 * not, so the split happens here where the LBA range is still
-		 * known rather than inside the WAL. Both halves land in the same
-		 * chunk and are merged by the overlay, so this costs nothing
-		 * beyond one extra entry. */
-		if (bs_io->is_write && ctx->wal) {
-			this_len = (uint32_t)spdk_min(this_len, S3_WAL_MAX_PAYLOAD);
-		}
-
-		cio = calloc(1, sizeof(*cio));
-		if (!cio) {
-			if (bs_io->status == 0) {
-				bs_io->status = -ENOMEM;
+		if (!bs_io->inline_cio_used) {
+			cio = &bs_io->inline_cio;
+			memset(cio, 0, sizeof(*cio));
+			cio->embedded = true;
+			bs_io->inline_cio_used = true;
+		} else {
+			cio = calloc(1, sizeof(*cio));
+			if (!cio) {
+				if (bs_io->status == 0) {
+					bs_io->status = -ENOMEM;
+				}
+				break;
 			}
-			break;
 		}
 
 		cio->bs_io           = bs_io;
@@ -1242,6 +2059,198 @@ s3_bs_io_submit(void *arg)
 }
 
 static void
+s3_bs_submit_fill_finish(void *arg)
+{
+	struct s3_bs_io *bs_io = arg;
+	struct s3_ctx *ctx = bs_io->ctx;
+	struct spdk_uuid current_uuid;
+	struct spdk_bs_dev_cb_args *cb_args;
+	bool mapping_unchanged;
+	int rc;
+
+	/* Normally delivered on submit_thread. If that thread has stopped
+	 * accepting messages, the fill path invokes this locally rather than lose
+	 * a blobstore completion forever. The immutable map/overlay checks below
+	 * are the same off-owner checks used by the ordinary fast path. */
+	mapping_unchanged =
+		s3_chunk_map_lookup(ctx->chunk_map, bs_io->cache_chunk_index,
+				    &current_uuid, NULL) == 0 &&
+		spdk_uuid_compare(&current_uuid, &bs_io->cache_uuid) == 0;
+	if (mapping_unchanged &&
+	    !s3_overlay_chunk_is_live(ctx->overlay, bs_io->cache_chunk_index)) {
+		cb_args = bs_io->cb_args;
+		free(bs_io);
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+		return;
+	}
+
+	/* The immutable bytes were valid when fetched, but a write or flush moved
+	 * the visible version before delivery. Re-run on the owner so the overlay
+	 * is merged or the new uuid is read. */
+	rc = spdk_thread_send_msg(ctx->owner_thread, s3_bs_io_submit, bs_io);
+	if (rc != 0) {
+		cb_args = bs_io->cb_args;
+		free(bs_io);
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
+s3_bs_submit_cache_finish(void *arg)
+{
+	struct s3_bs_io *bs_io = arg;
+	struct s3_ctx *ctx = bs_io->ctx;
+	struct spdk_uuid current_uuid;
+	uint32_t valid_bytes;
+	bool mapping_unchanged;
+	int rc;
+
+	assert(bs_io->submit_thread == spdk_get_thread());
+	mapping_unchanged =
+		s3_chunk_map_lookup(ctx->chunk_map, bs_io->cache_chunk_index,
+				    &current_uuid, &valid_bytes) == 0 &&
+		spdk_uuid_compare(&current_uuid, &bs_io->cache_uuid) == 0;
+	if (bs_io->cache_status == 0 &&
+	    !s3_overlay_chunk_is_live(ctx->overlay, bs_io->cache_chunk_index) &&
+	    mapping_unchanged) {
+		struct spdk_bs_dev_cb_args *cb_args = bs_io->cb_args;
+
+		__atomic_fetch_add(&ctx->dest_submit_cache_hits, 1,
+				   __ATOMIC_RELAXED);
+		free(bs_io);
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+		return;
+	}
+
+	/* A local-device error is a cache miss from the user's perspective. Also
+	 * retry when an acknowledged write entered the overlay while the local
+	 * read was in flight: the owner path will merge it before completion.
+	 * The cache dropped a failed entry, so either retry makes progress. */
+	__atomic_fetch_add(&ctx->dest_submit_cache_retries, 1,
+			   __ATOMIC_RELAXED);
+	rc = spdk_thread_send_msg(ctx->owner_thread, s3_bs_io_submit, bs_io);
+	if (rc != 0) {
+		struct spdk_bs_dev_cb_args *cb_args = bs_io->cb_args;
+
+		free(bs_io);
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
+static void
+s3_bs_submit_cache_done(void *arg, int status)
+{
+	struct s3_bs_io *bs_io = arg;
+	int rc;
+
+	assert(bs_io->submit_thread == spdk_get_thread());
+	bs_io->cache_status = status;
+
+	/* A local bdev is allowed to complete during spdk_bdev_read(). Always
+	 * defer so blobstore never receives its callback from inside its own
+	 * bs_dev->read call. The delayed recheck in finish also widens protection
+	 * against a write entering the overlay behind this cache read. */
+	rc = spdk_thread_send_msg(bs_io->submit_thread,
+				  s3_bs_submit_cache_finish, bs_io);
+	if (rc != 0) {
+		/* This can only happen when the current thread has stopped accepting
+		 * messages. Completing from inside spdk_bdev_read() is normally
+		 * avoided to prevent recursive blobstore metadata reads, but losing
+		 * the completion hangs this I/O forever and is worse. */
+		SPDK_ERRLOG("Failed to defer submit-thread cache completion: %d; "
+			    "delivering locally\n", rc);
+		s3_bs_submit_cache_finish(bs_io);
+	}
+}
+
+/* Try the conservative off-owner path: one mapped slice, wholly inside the
+ * immutable object, for a chunk with no overlay. A write on another chunk
+ * must not disable this. A cache miss changes no state and falls back to
+ * the existing owner path. */
+static bool
+s3_bs_try_submit_cache(struct s3_bs_io *bs_io, struct spdk_io_channel *channel)
+{
+	struct s3_ctx *ctx = bs_io->ctx;
+	struct s3_bs_channel *ch;
+	struct s3_cache *cache;
+	struct s3_dest_fill_waiter *waiter;
+	struct spdk_uuid uuid;
+	char key[S3_KEY_MAX];
+	uint64_t chunk_index;
+	uint64_t length_bytes;
+	uint32_t offset_in_chunk;
+	uint32_t length;
+	uint32_t valid_bytes;
+	int rc;
+
+	cache = __atomic_load_n(&ctx->cache, __ATOMIC_ACQUIRE);
+	/* destroying is sampled here, not under cache->lock. That is enough:
+	 * this function is only reached from a blobstore read(), and
+	 * s3_bs_dev_destroy() cannot run until that read has completed back
+	 * into blobstore. Overlay / chunk_map stay alive for the same reason. */
+	if (!cache || !channel || !ctx->owner_thread || !ctx->overlay ||
+	    __atomic_load_n(&ctx->destroying, __ATOMIC_ACQUIRE)) {
+		return false;
+	}
+
+	offset_in_chunk = s3_lba_offset_in_chunk(bs_io->lba, ctx->chunk_shift);
+	length_bytes = (uint64_t)bs_io->lba_count << S3LVOL_BLOCK_SHIFT;
+	if (length_bytes > ctx->chunk_size - offset_in_chunk) {
+		return false;
+	}
+	length = (uint32_t)length_bytes;
+
+	chunk_index = s3_lba_to_chunk_index(bs_io->lba, ctx->chunk_shift);
+	if (s3_overlay_chunk_is_live(ctx->overlay, chunk_index)) {
+		return false;
+	}
+	rc = s3_chunk_map_lookup(ctx->chunk_map, chunk_index, &uuid,
+				 &valid_bytes);
+	if (rc != 0 || offset_in_chunk >= valid_bytes ||
+	    length > valid_bytes - offset_in_chunk) {
+		return false;
+	}
+
+	ch = spdk_io_channel_get_ctx(channel);
+	if (!ch || ch->ctx != ctx) {
+		return false;
+	}
+	if (!ch->cache_ch) {
+		ch->cache_ch = s3_cache_get_io_channel(cache);
+		if (!ch->cache_ch) {
+			return false;
+		}
+	}
+
+	bs_io->cache_chunk_index = chunk_index;
+	spdk_uuid_copy(&bs_io->cache_uuid, &uuid);
+	rc = s3_cache_read_on_channel(cache, ch->cache_ch, chunk_index, &uuid,
+				      offset_in_chunk, length, bs_io->payload,
+				      s3_bs_submit_cache_done, bs_io);
+	if (rc == 0) {
+		return true;
+	}
+
+	waiter = calloc(1, sizeof(*waiter));
+	if (!waiter) {
+		return false;
+	}
+	waiter->bs_io = bs_io;
+	waiter->origin = bs_io->submit_thread;
+	waiter->offset = offset_in_chunk;
+	waiter->length = length;
+	bs_io->submit_fill_tried = true;
+	s3_data_key(ctx, &uuid, key, sizeof(key));
+	rc = s3_dest_fill_submit_waiter(ctx, waiter, chunk_index, &uuid,
+					 valid_bytes, key);
+	if (rc != 0) {
+		free(waiter);
+		return false;
+	}
+	return true;
+}
+
+static void
 s3_bs_dev_rw(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     void *payload, uint64_t lba, uint32_t lba_count,
 	     struct spdk_bs_dev_cb_args *cb_args, bool is_write)
@@ -1279,6 +2288,12 @@ s3_bs_dev_rw(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	bs_io->lba           = lba;
 	bs_io->lba_count     = lba_count;
 	bs_io->submit_thread = spdk_get_thread();
+
+	if (!is_write && ctx->owner_thread &&
+	    ctx->owner_thread != bs_io->submit_thread &&
+	    s3_bs_try_submit_cache(bs_io, channel)) {
+		return;
+	}
 
 	if (ctx->owner_thread == NULL ||
 	    ctx->owner_thread == bs_io->submit_thread) {
@@ -1505,6 +2520,7 @@ s3_unmap_chunk_removed(void *cb_arg, const struct spdk_uuid *old_uuid, int statu
  * Replaying only the writes would resurrect data the caller discarded. */
 struct s3_unmap_io {
 	struct s3_unmap_ctx *uctx;
+	struct s3_writeback_wal_op *wb;
 
 	uint64_t chunk_index;
 	uint64_t lba;
@@ -1516,80 +2532,166 @@ struct s3_unmap_io {
 	bool whole;
 };
 
-static void s3_unmap_wal_submit(void *arg);
+static void s3_unmap_shm_submit(void *arg);
 
 static void
-s3_unmap_wal_done(void *cb_arg, int status)
+s3_zero_overlay_release(void *cb_arg)
 {
-	struct s3_unmap_io *uio = cb_arg;
-	struct s3_unmap_ctx *uctx = uio->uctx;
-	struct s3_ctx *ctx = uctx->ctx;
+	struct s3_writeback_wal_op *op = cb_arg;
+
+	assert(op->overlay_refs > 0);
+	op->overlay_refs--;
+	if (op->overlay_refs == 0) {
+		s3_writeback_op_maybe_release(op);
+	}
+}
+
+/* Install a ZEROES record as borrowed zero blocks.  The shm record stays
+ * until the flusher drops the last block.  Consumes op on every return. */
+static int
+s3_writeback_install_zeroes(struct s3_ctx *ctx, struct s3_writeback_wal_op *op)
+{
+	void *buf;
 	int rc;
 
-	if (status == -EAGAIN) {
-		s3_flusher_kick(ctx->flusher);
-		if (s3_retry_queue(ctx, s3_unmap_wal_submit, uio) == 0) {
-			return;
-		}
-		status = -ENOMEM;
+	buf = calloc(op->nblocks, ctx->bs_dev.blocklen);
+	if (!buf) {
+		s3_writeback_record_discard(op, -ENOMEM);
+		free(op);
+		return -ENOMEM;
 	}
-	if (status != 0) {
+	op->zero_buf = buf;
+	op->overlay_refs = op->nblocks;
+	op->submitting = true;
+	rc = s3_overlay_write_durable_ref(ctx->overlay, op->lba, op->nblocks,
+					  buf, op->wal_seq,
+					  s3_zero_overlay_release, op);
+	op->submitting = false;
+	if (rc != 0) {
+		s3_writeback_record_discard(op, rc);
+		free(op->zero_buf);
+		free(op);
+		return rc;
+	}
+	op->overlay_published = true;
+	op->wal_finished = true;
+	s3_flusher_kick(ctx->flusher);
+	s3_writeback_op_maybe_release(op);
+	return 0;
+}
+
+static void
+s3_unmap_shm_chunk_removed(void *cb_arg, const struct spdk_uuid *old_uuid,
+			   int status)
+{
+	struct s3_unmap_io *uio = cb_arg;
+	struct s3_writeback_wal_op *op = uio->wb;
+	struct s3_unmap_ctx *uctx = uio->uctx;
+	struct s3_ctx *ctx = uctx->ctx;
+
+	if (status != 0 && status != -ENOENT) {
+		/* The mapping is unchanged. Retire the shm record so recovery
+		 * does not apply an unmap the guest was told failed, and leave
+		 * the overlay where the acknowledged data still is. */
+		op->completion_status = status;
+		s3_writeback_record_discard(op, status);
+		op->wal_finished = true;
+		s3_writeback_op_maybe_release(op);
+		free(uio);
+		s3_unmap_chunk_removed(uctx, old_uuid, status);
+		return;
+	}
+
+	/* The journal remove is durable. Drop only blocks this unmap
+	 * supersedes: a write assigned a newer sequence while the remove was
+	 * in flight has to stay. */
+	s3_overlay_drop_chunk_upto(ctx->overlay, uio->chunk_index, op->wal_seq);
+	s3_cache_drop_chunk(ctx->cache, uio->chunk_index);
+	op->overlay_published = true;
+	op->wal_finished = true;
+	s3_writeback_op_maybe_release(op);
+	free(uio);
+	s3_unmap_chunk_removed(uctx, old_uuid, status);
+}
+
+static void
+s3_unmap_shm_submit(void *arg)
+{
+	struct s3_unmap_io *uio = arg;
+	struct s3_unmap_ctx *uctx = uio->uctx;
+	struct s3_ctx *ctx = uctx->ctx;
+	struct s3_writeback_wal_op *op;
+	uint64_t seq = 0;
+	int rc;
+
+	op = calloc(1, sizeof(*op));
+	if (!op) {
 		if (uctx->status == 0) {
-			uctx->status = status;
+			uctx->status = -ENOMEM;
 		}
 		free(uio);
 		s3_unmap_put(uctx);
 		return;
 	}
+	op->ctx = ctx;
+	op->lba = uio->lba;
+	op->chunk_index = uio->chunk_index;
+	op->nblocks = uio->nblocks;
+	rc = s3_writeback_publish(ctx->writeback,
+				  uio->whole ? S3_WRITEBACK_UNMAP :
+					       S3_WRITEBACK_ZEROES,
+				  uio->lba, uio->nblocks, NULL, 0,
+				  uio->chunk_index, &op->writeback_seq,
+				  &op->record);
+	if (rc == -ENOSPC) {
+		free(op);
+		op = NULL;
+		s3_flusher_kick(ctx->flusher);
+		if (s3_retry_queue(ctx, s3_unmap_shm_submit, uio) == 0) {
+			return;
+		}
+		rc = -ENOMEM;
+	}
+	if (rc != 0) {
+		free(op);
+		if (uctx->status == 0) {
+			uctx->status = rc;
+		}
+		free(uio);
+		s3_unmap_put(uctx);
+		return;
+	}
+	rc = s3_writeback_assign_seq(ctx, &op->record, &seq);
+	if (rc != 0) {
+		s3_writeback_record_discard(op, rc);
+		free(op);
+		if (uctx->status == 0) {
+			uctx->status = rc;
+		}
+		free(uio);
+		s3_unmap_put(uctx);
+		return;
+	}
+	op->wal_seq = seq;
+	uio->wb = op;
 
 	if (uio->whole) {
-		/* Everything the overlay held for this chunk is void now, and the
-		 * epoch bump makes a flush that already collected it give up
-		 * instead of publishing unmapped content. */
-		s3_overlay_drop_chunk(ctx->overlay, uio->chunk_index);
-		/* Not needed for correctness -- an unmapped chunk has no uuid left
-		 * for a reader to ask for, so the entry could never be returned --
-		 * but it frees the slot now instead of at the end of the LRU. A
-		 * discard of a large range would otherwise leave the cache full of
-		 * entries for chunks that no longer exist. */
-		s3_cache_drop_chunk(ctx->cache, uio->chunk_index);
+		/* The overlay stays until the journal remove succeeds. Dropping
+		 * it first turns a failed remove into lost acknowledged data:
+		 * the guest sees the error, and the shm record is still there
+		 * for recovery to drop the chunk again. */
 		s3_chunk_map_remove(ctx->chunk_map, uio->chunk_index,
-				    s3_unmap_chunk_removed, uctx);
-		/* The reference passes to s3_unmap_chunk_removed(). */
-		free(uio);
+				    s3_unmap_shm_chunk_removed, uio);
 		return;
 	}
 
-	/* Partial cover: record zeroes and let the flusher rewrite the object.
-	 * The direct-to-S3 path silently skipped this case, which left the old
-	 * bytes readable; here it can be done properly for the cost of one
-	 * flush. */
-	rc = s3_overlay_write(ctx->overlay, uio->lba, uio->nblocks, NULL,
-			      uio->wal_seq);
+	rc = s3_writeback_install_zeroes(ctx, op);
+	uio->wb = NULL;
+	free(uio);
 	if (rc != 0 && uctx->status == 0) {
 		uctx->status = rc;
 	}
-	s3_flusher_kick(ctx->flusher);
-
-	free(uio);
 	s3_unmap_put(uctx);
-}
-
-static void
-s3_unmap_wal_submit(void *arg)
-{
-	struct s3_unmap_io *uio = arg;
-	struct s3_ctx *ctx = uio->uctx->ctx;
-
-	if (uio->whole) {
-		s3_wal_append_unmap(ctx->wal, uio->lba, uio->nblocks,
-				    uio->chunk_index, &uio->wal_seq,
-				    s3_unmap_wal_done, uio);
-	} else {
-		s3_wal_append_zeroes(ctx->wal, uio->lba, uio->nblocks,
-				     uio->chunk_index, &uio->wal_seq,
-				     s3_unmap_wal_done, uio);
-	}
 }
 
 /* Release the mappings. Runs on the owner thread. */
@@ -1612,6 +2714,7 @@ s3_unmap_submit(void *arg)
 		bool whole = (cur == chunk_start && end >= chunk_end);
 
 		if (ctx->wal) {
+			assert(ctx->writeback != NULL);
 			struct s3_unmap_io *uio = calloc(1, sizeof(*uio));
 
 			if (!uio) {
@@ -1627,7 +2730,7 @@ s3_unmap_submit(void *arg)
 			uio->whole       = whole;
 
 			uctx->refcnt++;
-			s3_unmap_wal_submit(uio);
+			s3_unmap_shm_submit(uio);
 		} else if (whole) {
 			/* Only release the mapping when the chunk is fully
 			 * covered; a partial cover would need a read-modify-write
@@ -1752,24 +2855,165 @@ s3_bs_dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 }
 
 static void
+s3_bs_dev_flush_done(void *arg, int status)
+{
+	struct spdk_bs_dev_cb_args *cb_args = arg;
+
+	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, status);
+}
+
+static void
 s3_bs_dev_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		struct spdk_bs_dev_cb_args *cb_args)
 {
-	(void)dev;
 	(void)channel;
 
-	/* Nothing to do in either mode, for different reasons.
-	 *
-	 * Direct to S3: a PUT is durable by the time it completes.
-	 * With a WAL: a write is only acknowledged once its batch is durable on
-	 * the local bdev, so everything blobstore believes it wrote already is.
-	 *
-	 * This deliberately does *not* wait for the flusher. flush only has to
-	 * guarantee durability, and blobstore issues it often (persisting
-	 * metadata, unloading); forcing a full S3 round trip for every one of
-	 * those would be pointless. Waiting for S3 durability is a separate
-	 * operation -- s3_bs_dev_drain(). */
-	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
+	/* Direct-to-S3 writes are already durable.  Write-back acknowledges from
+	 * shm, which survives a process crash, so blobstore's own flush does not
+	 * wait for the disk log or for S3. Guest FLUSH/FUA has the same
+	 * process-crash durability contract at the exported lvol layer. */
+	if (((struct s3_ctx *)dev)->writeback) {
+		s3_bs_dev_flush_done(cb_args, 0);
+		return;
+	}
+	if (((struct s3_ctx *)dev)->wal) {
+		s3_bs_dev_wal_flush(dev, s3_bs_dev_flush_done, cb_args);
+		return;
+	}
+	s3_bs_dev_flush_done(cb_args, 0);
+}
+
+struct s3_wal_flush_req {
+	struct s3_ctx       *ctx;
+	struct spdk_thread  *submit_thread;
+	s3_bs_dev_cb         cb_fn;
+	void                *cb_arg;
+	int                  status;
+};
+
+static void s3_wal_flush_submit(void *arg);
+
+static void
+s3_wal_flush_deliver(void *arg)
+{
+	struct s3_wal_flush_req *req = arg;
+	s3_bs_dev_cb cb_fn = req->cb_fn;
+	void *cb_arg = req->cb_arg;
+	int status = req->status;
+
+	free(req);
+	if (cb_fn) {
+		cb_fn(cb_arg, status);
+	}
+}
+
+static void
+s3_wal_flush_finish(struct s3_wal_flush_req *req, int status)
+{
+	int rc;
+
+	req->status = status;
+	if (req->submit_thread == spdk_get_thread()) {
+		s3_wal_flush_deliver(req);
+		return;
+	}
+
+	rc = spdk_thread_send_msg(req->submit_thread, s3_wal_flush_deliver, req);
+	if (rc != 0) {
+		/* Completing a bdev I/O on the owner thread corrupts the submitting
+		 * channel's request list.  A leak is preferable to that corruption,
+		 * matching s3_bs_io_complete(). */
+		SPDK_ERRLOG("Failed to bounce WAL flush completion: %d "
+			    "(leaking the request)\n", rc);
+	}
+}
+
+static void
+s3_wal_flush_done(void *cb_arg, int status)
+{
+	struct s3_wal_flush_req *req = cb_arg;
+
+	if (status == -EAGAIN) {
+		req->ctx->wal_retries++;
+		s3_flusher_kick(req->ctx->flusher);
+		if (s3_retry_queue(req->ctx, s3_wal_flush_submit, req) == 0) {
+			return;
+		}
+		status = -ENOMEM;
+	}
+	if (status == 0) {
+		status = __atomic_load_n(&req->ctx->wal_writeback_error,
+					 __ATOMIC_ACQUIRE);
+	}
+	s3_wal_flush_finish(req, status);
+}
+
+static void
+s3_wal_flush_submit(void *arg)
+{
+	struct s3_wal_flush_req *req = arg;
+
+	assert(req->ctx->owner_thread == NULL ||
+	       req->ctx->owner_thread == spdk_get_thread());
+	s3_wal_append_barrier(req->ctx->wal, NULL, s3_wal_flush_done, req);
+}
+
+void
+s3_bs_dev_wal_flush(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_wal_flush_req *req;
+	int rc;
+
+	if (!ctx) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -EINVAL);
+		}
+		return;
+	}
+	if (!ctx->wal) {
+		if (cb_fn) {
+			cb_fn(cb_arg, 0);
+		}
+		return;
+	}
+	/* The shared-memory write-back ring is itself the durability boundary and
+	 * carries every post-replay payload. Appending a disk-WAL barrier here
+	 * would assign it a sequence above disk_seq_limit, where truncation must
+	 * never advance for old-binary replay compatibility. Such barriers could
+	 * therefore only consume WAL space; they fence no disk payload. */
+	if (ctx->writeback) {
+		if (cb_fn) {
+			cb_fn(cb_arg, __atomic_load_n(&ctx->wal_writeback_error,
+						    __ATOMIC_ACQUIRE));
+		}
+		return;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+	req->ctx = ctx;
+	req->submit_thread = spdk_get_thread();
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	if (ctx->owner_thread == NULL ||
+	    ctx->owner_thread == req->submit_thread) {
+		s3_wal_flush_submit(req);
+		return;
+	}
+	rc = spdk_thread_send_msg(ctx->owner_thread, s3_wal_flush_submit, req);
+	if (rc != 0) {
+		free(req);
+		if (cb_fn) {
+			cb_fn(cb_arg, rc);
+		}
+	}
 }
 
 /* Per-channel state. Currently empty -- the S3 client manages its own
@@ -1784,10 +3028,6 @@ s3_bs_dev_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
  *
  * blob_bdev gets its channel from spdk_bdev_get_io_channel(); there is no
  * bdev underneath us, so we register our own io_device. */
-struct s3_bs_channel {
-	struct s3_ctx   *ctx;
-};
-
 static int
 s3_bs_channel_create_cb(void *io_device, void *ctx_buf)
 {
@@ -1800,8 +3040,12 @@ s3_bs_channel_create_cb(void *io_device, void *ctx_buf)
 static void
 s3_bs_channel_destroy_cb(void *io_device, void *ctx_buf)
 {
+	struct s3_bs_channel *ch = ctx_buf;
+
 	(void)io_device;
-	(void)ctx_buf;
+	if (ch->cache_ch) {
+		spdk_put_io_channel(ch->cache_ch);
+	}
 }
 
 static struct spdk_io_channel *
@@ -1831,6 +3075,7 @@ s3_bs_dev_free_cb(void *io_device)
 	struct s3_ctx *ctx = io_device;
 	s3_bs_dev_cb cb_fn = ctx->destroy_cb;
 	void *cb_arg = ctx->destroy_arg;
+	int destroy_status;
 
 	/* Nothing may still be able to reach ctx, the chunk map or the journal. A
 	 * checkpoint is the one thing that can be outstanding without holding a
@@ -1844,6 +3089,8 @@ s3_bs_dev_free_cb(void *io_device)
 			    "freed memory\n", ctx->prefix, ctx->ckpt_gen);
 		assert(false);
 	}
+	assert(TAILQ_EMPTY(&ctx->read_fills));
+	assert(ctx->dest_fills_inflight == 0);
 
 	/* Before the map goes: this is the only point where it reflects every
 	 * object the lvstore owns, blobstore's unload writes included. Destroy
@@ -1852,12 +3099,37 @@ s3_bs_dev_free_cb(void *io_device)
 		ctx->reap_cb(ctx->reap_arg, ctx->chunk_map);
 	}
 
+	/* Overlay blocks may borrow payloads from the write-back mapping. Drop
+	 * those references before closing or unmapping the ring. */
 	s3_overlay_destroy(ctx->overlay);
+	ctx->overlay = NULL;
+	if (ctx->writeback) {
+		struct s3_writeback_stats st = {0};
+
+		if (s3_writeback_get_stats(ctx->writeback, &st) == 0 &&
+		    st.pending_records != 0) {
+			SPDK_WARNLOG("Closing '%s' with %" PRIu64
+				     " shared write-back record(s) retained for "
+				     "recovery\n", ctx->prefix, st.pending_records);
+		}
+		s3_writeback_close(ctx->writeback);
+		ctx->writeback = NULL;
+		/* Normal unload reaches here only after WAL+S3 drain, so this
+		 * removes an empty object.  ENOTEMPTY deliberately preserves
+		 * crash-recovery data after an error path. */
+		int rc = s3_writeback_cleanup(ctx->prefix);
+
+		if (rc != 0 && rc != -ENOENT && ctx->destroy_status == 0) {
+			ctx->destroy_status = rc;
+		}
+	}
 	/* After the overlay and before the chunk map, though the order does not
 	 * matter here: by now nothing can reach the cache, and teardown has already
 	 * waited for its writes. */
 	s3_cache_destroy(ctx->cache);
 	s3_chunk_map_destroy(ctx->chunk_map);
+	pthread_mutex_destroy(&ctx->read_fill_lock);
+	destroy_status = ctx->destroy_status;
 	free(ctx->prefix);
 	free(ctx);
 
@@ -1865,7 +3137,7 @@ s3_bs_dev_free_cb(void *io_device)
 	 * release the journal and the local device, which the chunk map and the
 	 * WAL were still writing to a moment ago. */
 	if (cb_fn) {
-		cb_fn(cb_arg, 0);
+		cb_fn(cb_arg, destroy_status);
 	}
 }
 
@@ -1898,11 +3170,18 @@ s3_bs_dev_wal_closed(void *cb_arg, int status)
 {
 	struct s3_ctx *ctx = cb_arg;
 
-	if (status != 0) {
+	if (status == -EBUSY) {
 		SPDK_ERRLOG("Failed to close the WAL: %d — the log stays on disk "
-			    "and will be replayed on the next attach\n", status);
+			    "and the bs_dev stays alive to protect outstanding "
+			    "callbacks\n", status);
+		return;
 	}
 	ctx->wal = NULL;
+	if (status != 0 && ctx->destroy_status == 0) {
+		ctx->destroy_status = status;
+		SPDK_ERRLOG("WAL close failed after releasing the log: %d\n",
+			    status);
+	}
 
 	spdk_io_device_unregister(ctx, s3_bs_dev_free_cb);
 }
@@ -1936,9 +3215,38 @@ s3_bs_dev_flusher_drained(void *cb_arg, int status)
 	spdk_io_device_unregister(ctx, s3_bs_dev_free_cb);
 }
 
+static void
+s3_bs_dev_teardown_wal_done(void *cb_arg, int status)
+{
+	struct s3_ctx *ctx = cb_arg;
+
+	if (status != 0) {
+		SPDK_WARNLOG("WAL barrier failed during destroy of '%s': %d; "
+			     "shared-memory records stay available for recovery\n",
+			     ctx->prefix, status);
+	}
+	if (ctx->flusher) {
+		s3_flusher_drain(ctx->flusher, 0, s3_bs_dev_flusher_drained, ctx);
+		return;
+	}
+	s3_bs_dev_drop_retries(ctx);
+	spdk_io_device_unregister(ctx, s3_bs_dev_free_cb);
+}
+
 static void s3_bs_dev_teardown(struct s3_ctx *ctx);
 
-/* Wait out an in-flight cache fill, then resume teardown.
+static bool
+s3_dest_fills_quiesced(struct s3_ctx *ctx)
+{
+	bool quiesced;
+
+	pthread_mutex_lock(&ctx->read_fill_lock);
+	quiesced = ctx->dest_fills_inflight == 0;
+	pthread_mutex_unlock(&ctx->read_fill_lock);
+	return quiesced;
+}
+
+/* Wait out in-flight cache and destination fills, then resume teardown.
  *
  * Registered only when there is something to wait for; see the call site for why
  * waiting is necessary at all. */
@@ -1947,7 +3255,9 @@ s3_cache_quiesce_poll(void *arg)
 {
 	struct s3_ctx *ctx = arg;
 
-	if (!s3_cache_is_quiesced(ctx->cache)) {
+	if (ctx->inflight != 0 ||
+	    !s3_dest_fills_quiesced(ctx) ||
+	    !s3_cache_is_quiesced(ctx->cache)) {
 		return SPDK_POLLER_BUSY;
 	}
 
@@ -1992,16 +3302,42 @@ s3_bs_dev_teardown(struct s3_ctx *ctx)
 	 *
 	 * In practice the WAL close that follows takes a write plus a flush and the
 	 * fill would land inside it, but "usually long enough" is not a lifetime
-	 * rule. New fills cannot start, because s3_flush_map_updated stops
-	 * populating once ctx->destroying is set. */
-	if (ctx->cache && !s3_cache_is_quiesced(ctx->cache)) {
+	 * rule. New native fills cannot start because s3_flush_map_updated checks
+	 * ctx->destroying; s3_cache_stop_object_io() closes the imported-object
+	 * lane under the cache lock before this quiescence check. A preheat
+	 * reservation still owns its slot until the GET completes, and
+	 * s3_cache_is_quiesced() stays false for that long so the completion
+	 * does not run against a freed cache.
+	 *
+	 * Off-owner cache hits are not counted in ctx->inflight or in
+	 * s3_cache_is_quiesced() until they take the cache lock. They do not need
+	 * to: blobstore only calls destroy() after every read() it submitted has
+	 * completed, so a thread that has passed the destroying check in
+	 * s3_bs_try_submit_cache() is still outstanding blobstore I/O. Dest fills
+	 * are ours rather than blobstore's, which is why they re-check destroying
+	 * under read_fill_lock -- the same lock s3_dest_fills_quiesced() takes.
+	 * ctx->inflight covers owner-path I/O whose completion has already
+	 * decremented the counter but not yet been delivered. */
+	if (ctx->inflight != 0 ||
+	    !s3_dest_fills_quiesced(ctx) ||
+	    (ctx->cache && !s3_cache_is_quiesced(ctx->cache))) {
 		if (!ctx->cache_quiesce_poller) {
 			SPDK_NOTICELOG("Destroying s3_bs_dev for '%s': waiting for "
-				       "a cache fill to land\n", ctx->prefix);
+				       "destination/cache fills to land\n", ctx->prefix);
 			ctx->cache_quiesce_poller =
 				SPDK_POLLER_REGISTER(s3_cache_quiesce_poll, ctx,
 						     S3_RETRY_POLL_US);
 			if (ctx->cache_quiesce_poller) {
+				return;
+			}
+			if (ctx->inflight != 0 ||
+			    !s3_dest_fills_quiesced(ctx)) {
+				/* A destination fill owns user I/O contexts and reaches
+				 * ctx from its token/GET completion. Proceeding would be
+				 * a UAF; leaking the device is the only safe fallback. */
+				SPDK_ERRLOG("Could not register the fill quiesce poller "
+					    "for '%s'; leaking the device while a "
+					    "destination fill is active\n", ctx->prefix);
 				return;
 			}
 			/* No poller to be had. Falling through would free the
@@ -2027,7 +3363,11 @@ s3_bs_dev_teardown(struct s3_ctx *ctx)
 		 * go of it, so it can safely stay alive until S3 has the data --
 		 * which is what INV2 requires. The caller learns when that is done
 		 * through s3_bs_dev_set_destroy_cb(). */
-		s3_flusher_drain(ctx->flusher, 0, s3_bs_dev_flusher_drained, ctx);
+		if (!ctx->teardown_wal_barrier_started) {
+			ctx->teardown_wal_barrier_started = true;
+			s3_bs_dev_wal_flush(&ctx->bs_dev,
+					    s3_bs_dev_teardown_wal_done, ctx);
+		}
 		return;
 	}
 
@@ -2057,13 +3397,18 @@ s3_bs_dev_destroy(struct spdk_bs_dev *dev)
 		       "%" PRIu64 " WAL writes (%" PRIu64 " parked), "
 		       "%" PRIu64 " overlay reads, %" PRIu64 " chunks flushed, "
 		       "cache %" PRIu64 " hits / %" PRIu64 " misses (%" PRIu64
-		       " filled, %" PRIu64 " evicted)\n",
+		       " filled, %" PRIu64 " evicted), %" PRIu64
+		       " off-owner cache hit(s), %" PRIu64 " retried\n",
 		       s3_chunk_map_get_allocated(ctx->chunk_map),
 		       ctx->rmw_count, ctx->zero_fill_count,
 		       ctx->wal_writes, ctx->wal_retries, ctx->overlay_hits,
 		       fstats.chunks_flushed,
 		       cstats.hits, cstats.misses, cstats.populates,
-		       cstats.evictions);
+		       cstats.evictions,
+		       __atomic_load_n(&ctx->dest_submit_cache_hits,
+				       __ATOMIC_RELAXED),
+		       __atomic_load_n(&ctx->dest_submit_cache_retries,
+				       __ATOMIC_RELAXED));
 
 	/* First thing, before any of the waiting below: the poller must not start a
 	 * checkpoint from here on. Teardown is asynchronous -- a flusher drain and a
@@ -2072,9 +3417,13 @@ s3_bs_dev_destroy(struct spdk_bs_dev *dev)
 	 * started a checkpoint against a device being freed. That is how this was
 	 * found: a segfault in s3_journal_truncate() with the journal pointer reading
 	 * as "cos.ap-n", i.e. freed memory already reused for an endpoint string. */
-	ctx->destroying = true;
+	__atomic_store_n(&ctx->destroying, true, __ATOMIC_RELEASE);
+	s3_cache_stop_object_io(ctx->cache);
 	if (ctx->ckpt_poller) {
 		spdk_poller_unregister(&ctx->ckpt_poller);
+	}
+	if (ctx->flusher_resume_poller) {
+		spdk_poller_unregister(&ctx->flusher_resume_poller);
 	}
 
 	/* blobstore guarantees none of its own I/O is outstanding here ("once all
@@ -2114,6 +3463,563 @@ s3_bs_dev_destroy(struct spdk_bs_dev *dev)
 	}
 
 	s3_bs_dev_teardown(ctx);
+}
+
+/* ==========================================================================
+ * CopyObject ingest (decouple of a same-bucket export)
+ * ========================================================================== */
+
+#define S3_INGEST_SLOTS 32
+
+enum s3_ingest_slot_state {
+	S3_INGEST_FREE = 0,
+	S3_INGEST_COPYING,
+	S3_INGEST_READY,
+	S3_INGEST_BINDING,
+};
+
+struct s3_ingest_op;
+
+struct s3_ingest_slot {
+	struct s3_ctx            *ctx;
+	enum s3_ingest_slot_state state;
+	uint64_t                  src_chunk;
+	uint64_t                  dst_chunk;
+	struct spdk_uuid          uuid;
+	uint32_t                  valid_bytes;
+	char                      src_key[S3_KEY_MAX];
+	char                      dest_key[S3_KEY_MAX];
+	struct s3_ingest_op      *waiter;
+};
+
+struct s3_ingest {
+	char                     *src_endpoint;
+	char                      src_bucket[128];
+	s3_ingest_src_fn          src_fn;
+	void                     *src_arg;
+	/* CopyObjects plus in-flight chunk-map binds. End must not free this
+	 * struct until both have drained: bind callbacks keep a pointer into
+	 * slots[], which lives here. */
+	uint32_t                  inflight;
+	struct s3_ingest_slot     slots[S3_INGEST_SLOTS];
+	s3_bs_dev_cb              end_cb;
+	void                     *end_arg;
+	bool                      ending;
+};
+
+struct s3_ingest_op {
+	struct s3_ctx             *ctx;
+	struct spdk_bs_dev_cb_args *cb_args;
+	struct spdk_thread       *submit_thread;
+	uint64_t                   dst_lba;
+	uint64_t                   src_lba;
+	uint64_t                   lba_count;
+	uint64_t                   pos;
+	int                        status;
+};
+
+struct ingest_prefetch_msg {
+	struct s3_ctx *ctx;
+	uint64_t        src_lba;
+	uint64_t        lba_count;
+};
+
+static void s3_bs_dev_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+			   uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
+			   struct spdk_bs_dev_cb_args *cb_args);
+static void ingest_op_next(struct s3_ingest_op *op);
+static void ingest_op_complete(struct s3_ingest_op *op, int status);
+static void ingest_try_finish_end(struct s3_ctx *ctx);
+static int ingest_start_slot(struct s3_ingest_slot *slot, uint64_t src_chunk);
+static void ingest_bound(void *cb_arg, const struct spdk_uuid *old_uuid, int status);
+static void ingest_start_bind(struct s3_ingest_slot *slot, uint64_t dst_chunk);
+
+static void
+ingest_op_deliver(void *arg)
+{
+	struct s3_ingest_op *op = arg;
+
+	op->cb_args->cb_fn(op->cb_args->channel, op->cb_args->cb_arg, op->status);
+	free(op);
+}
+
+static void
+ingest_op_complete(struct s3_ingest_op *op, int status)
+{
+	int rc;
+
+	op->status = status;
+	if (!op->submit_thread || op->submit_thread == spdk_get_thread()) {
+		ingest_op_deliver(op);
+		return;
+	}
+	rc = spdk_thread_send_msg(op->submit_thread, ingest_op_deliver, op);
+	if (rc != 0) {
+		SPDK_ERRLOG("ingest copy complete bounce failed: %s\n",
+			    spdk_strerror(-rc));
+		ingest_op_deliver(op);
+	}
+}
+
+static struct s3_ingest_slot *
+ingest_find_slot(struct s3_ingest *in, uint64_t src_chunk, bool alloc_free)
+{
+	struct s3_ingest_slot *free_slot = NULL;
+	uint32_t i;
+
+	for (i = 0; i < S3_INGEST_SLOTS; i++) {
+		if (in->slots[i].state != S3_INGEST_FREE &&
+		    in->slots[i].src_chunk == src_chunk) {
+			return &in->slots[i];
+		}
+		if (alloc_free && in->slots[i].state == S3_INGEST_FREE &&
+		    free_slot == NULL) {
+			free_slot = &in->slots[i];
+		}
+	}
+	return alloc_free ? free_slot : NULL;
+}
+
+static void
+ingest_slot_reset(struct s3_ingest_slot *slot)
+{
+	memset(slot, 0, sizeof(*slot));
+}
+
+/* Drop a CopyObject that never made it into the chunk map. Fire-and-forget
+ * delete: a missing key (copy never landed) is fine. */
+static void
+ingest_abandon_copy(struct s3_ingest_slot *slot)
+{
+	struct s3_ctx *ctx = slot->ctx;
+
+	if (ctx && ctx->client && slot->dest_key[0] != '\0') {
+		s3_delete(ctx->client, slot->dest_key, NULL, NULL);
+	}
+	ingest_slot_reset(slot);
+}
+
+static bool
+ingest_has_async_slots(struct s3_ingest *in)
+{
+	uint32_t i;
+
+	for (i = 0; i < S3_INGEST_SLOTS; i++) {
+		if (in->slots[i].state == S3_INGEST_COPYING ||
+		    in->slots[i].state == S3_INGEST_BINDING) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+ingest_try_finish_end(struct s3_ctx *ctx)
+{
+	struct s3_ingest *in = ctx->ingest;
+	s3_bs_dev_cb cb;
+	void *arg;
+	uint32_t i;
+
+	/* Do not free while a CopyObject or a chunk-map bind is still using a
+	 * slot. inflight should already cover both; the slot walk is in case a
+	 * bind was issued without a matching increment. */
+	if (!in || !in->ending || in->inflight != 0 || ingest_has_async_slots(in)) {
+		return;
+	}
+
+	for (i = 0; i < S3_INGEST_SLOTS; i++) {
+		if (in->slots[i].state == S3_INGEST_READY) {
+			s3_delete(ctx->client, in->slots[i].dest_key, NULL, NULL);
+			ingest_slot_reset(&in->slots[i]);
+		}
+	}
+
+	ctx->bs_dev.copy = NULL;
+	ctx->bs_dev.copy_on_materialize_only = false;
+	ctx->ingest = NULL;
+	cb = in->end_cb;
+	arg = in->end_arg;
+	free(in->src_endpoint);
+	free(in);
+	if (cb) {
+		cb(arg, 0);
+	}
+}
+
+static void
+ingest_start_bind(struct s3_ingest_slot *slot, uint64_t dst_chunk)
+{
+	struct s3_ctx *ctx = slot->ctx;
+	struct s3_ingest *in = ctx->ingest;
+
+	slot->state = S3_INGEST_BINDING;
+	slot->dst_chunk = dst_chunk;
+	in->inflight++;
+	s3_chunk_map_insert(ctx->chunk_map, dst_chunk, &slot->uuid,
+			    slot->valid_bytes, ingest_bound, slot);
+}
+
+static void
+ingest_bound(void *cb_arg, const struct spdk_uuid *old_uuid, int status)
+{
+	struct s3_ingest_slot *slot = cb_arg;
+	struct s3_ctx *ctx = slot->ctx;
+	struct s3_ingest *in;
+	struct s3_ingest_op *op;
+	uint32_t bpc;
+
+	if (!ctx || !ctx->ingest) {
+		return;
+	}
+	in = ctx->ingest;
+	if (in->inflight > 0) {
+		in->inflight--;
+	}
+
+	op = slot->waiter;
+	slot->waiter = NULL;
+
+	if (status != 0) {
+		/* Insert did not take: dest_key is unreferenced. */
+		ingest_abandon_copy(slot);
+		if (op) {
+			ingest_op_complete(op, status);
+		}
+		ingest_try_finish_end(ctx);
+		return;
+	}
+
+	if (old_uuid && !spdk_uuid_is_null(old_uuid)) {
+		char old_key[S3_KEY_MAX];
+
+		s3_data_key(ctx, old_uuid, old_key, sizeof(old_key));
+		s3_delete(ctx->client, old_key, NULL, NULL);
+	}
+
+	if (ctx->cache) {
+		struct s3_cache_object_id source = {
+			.endpoint = in->src_endpoint,
+			.bucket = in->src_bucket,
+			.key = slot->src_key,
+		};
+
+		s3_cache_object_alias(ctx->cache, &source, slot->dst_chunk,
+				      &slot->uuid, slot->valid_bytes);
+	}
+
+	ingest_slot_reset(slot);
+	if (!op) {
+		ingest_try_finish_end(ctx);
+		return;
+	}
+
+	bpc = s3_blocks_per_chunk(ctx);
+	op->pos += bpc;
+	ingest_op_next(op);
+	ingest_try_finish_end(ctx);
+}
+
+static void
+ingest_slot_copied(void *cb_arg, int status)
+{
+	struct s3_ingest_slot *slot = cb_arg;
+	struct s3_ctx *ctx = slot->ctx;
+	struct s3_ingest *in;
+
+	if (!ctx || !ctx->ingest) {
+		/* End already freed the parent struct that contains this slot. */
+		return;
+	}
+	in = ctx->ingest;
+
+	if (in->inflight > 0) {
+		in->inflight--;
+	}
+
+	if (status != 0) {
+		struct s3_ingest_op *op = slot->waiter;
+
+		slot->waiter = NULL;
+		ingest_abandon_copy(slot);
+		if (op) {
+			ingest_op_complete(op, status);
+		}
+		ingest_try_finish_end(ctx);
+		return;
+	}
+
+	slot->state = S3_INGEST_READY;
+	if (slot->waiter) {
+		uint64_t dst_chunk = s3_lba_to_chunk_index(
+					     slot->waiter->dst_lba + slot->waiter->pos,
+					     ctx->chunk_shift);
+
+		ingest_start_bind(slot, dst_chunk);
+	}
+	ingest_try_finish_end(ctx);
+}
+
+static int
+ingest_start_slot(struct s3_ingest_slot *slot, uint64_t src_chunk)
+{
+	struct s3_ctx *ctx = slot->ctx;
+	struct s3_ingest *in = ctx->ingest;
+	uint32_t valid_bytes = 0;
+	int rc;
+
+	rc = in->src_fn(in->src_arg, src_chunk, slot->src_key,
+			sizeof(slot->src_key), &valid_bytes);
+	if (rc != 0) {
+		return rc;
+	}
+
+	slot->src_chunk = src_chunk;
+	slot->valid_bytes = valid_bytes ? valid_bytes : ctx->chunk_size;
+	slot->state = S3_INGEST_COPYING;
+	spdk_uuid_generate(&slot->uuid);
+	s3_data_key(ctx, &slot->uuid, slot->dest_key, sizeof(slot->dest_key));
+	in->inflight++;
+
+	rc = s3_copy_object(ctx->client, in->src_bucket, slot->src_key,
+			    slot->dest_key, ingest_slot_copied, slot);
+	if (rc != 0) {
+		in->inflight--;
+		ingest_slot_reset(slot);
+		return rc;
+	}
+	return 0;
+}
+
+static void
+ingest_op_next(struct s3_ingest_op *op)
+{
+	struct s3_ctx *ctx = op->ctx;
+	struct s3_ingest *in = ctx->ingest;
+	struct s3_ingest_slot *slot;
+	uint64_t src_chunk, dst_off;
+	int rc;
+
+	if (op->pos >= op->lba_count) {
+		ingest_op_complete(op, 0);
+		return;
+	}
+
+	if (!in) {
+		ingest_op_complete(op, -EINVAL);
+		return;
+	}
+
+	dst_off = op->dst_lba + op->pos;
+	if (s3_lba_offset_in_chunk(dst_off, ctx->chunk_shift) != 0 ||
+	    s3_lba_offset_in_chunk(op->src_lba + op->pos, ctx->chunk_shift) != 0) {
+		ingest_op_complete(op, -EINVAL);
+		return;
+	}
+
+	src_chunk = s3_lba_to_chunk_index(op->src_lba + op->pos, ctx->chunk_shift);
+	slot = ingest_find_slot(in, src_chunk, true);
+	if (!slot) {
+		ingest_op_complete(op, -ENOMEM);
+		return;
+	}
+
+	if (slot->state == S3_INGEST_FREE) {
+		slot->ctx = ctx;
+		slot->waiter = op;
+		rc = ingest_start_slot(slot, src_chunk);
+		if (rc != 0) {
+			ingest_op_complete(op, rc);
+		}
+		return;
+	}
+
+	if (slot->state == S3_INGEST_COPYING) {
+		if (slot->waiter) {
+			ingest_op_complete(op, -EBUSY);
+			return;
+		}
+		slot->waiter = op;
+		return;
+	}
+
+	if (slot->state == S3_INGEST_READY) {
+		uint64_t dst_chunk = s3_lba_to_chunk_index(dst_off, ctx->chunk_shift);
+
+		slot->waiter = op;
+		ingest_start_bind(slot, dst_chunk);
+		return;
+	}
+
+	ingest_op_complete(op, -EBUSY);
+}
+
+static void
+ingest_op_on_owner(void *arg)
+{
+	ingest_op_next(arg);
+}
+
+static void
+s3_bs_dev_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
+	       uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
+	       struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)dev;
+	struct s3_ingest_op *op;
+	int rc;
+
+	(void)channel;
+
+	if (!ctx->ingest || lba_count == 0) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EINVAL);
+		return;
+	}
+
+	op = calloc(1, sizeof(*op));
+	if (!op) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOMEM);
+		return;
+	}
+	op->ctx = ctx;
+	op->cb_args = cb_args;
+	op->submit_thread = spdk_get_thread();
+	op->dst_lba = dst_lba;
+	op->src_lba = src_lba;
+	op->lba_count = lba_count;
+
+	if (ctx->owner_thread == NULL ||
+	    ctx->owner_thread == op->submit_thread) {
+		ingest_op_next(op);
+		return;
+	}
+	rc = spdk_thread_send_msg(ctx->owner_thread, ingest_op_on_owner, op);
+	if (rc != 0) {
+		ingest_op_complete(op, rc);
+	}
+}
+
+int
+s3_bs_dev_ingest_begin(struct spdk_bs_dev *bs_dev, const char *src_endpoint,
+		       const char *src_bucket, s3_ingest_src_fn src_fn,
+		       void *src_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_ingest *in;
+
+	if (!ctx || !src_endpoint || src_endpoint[0] == '\0' ||
+	    !src_bucket || !src_fn) {
+		return -EINVAL;
+	}
+	if (ctx->ingest) {
+		return -EEXIST;
+	}
+
+	in = calloc(1, sizeof(*in));
+	if (!in) {
+		return -ENOMEM;
+	}
+	in->src_endpoint = strdup(src_endpoint);
+	if (!in->src_endpoint) {
+		free(in);
+		return -ENOMEM;
+	}
+	snprintf(in->src_bucket, sizeof(in->src_bucket), "%s", src_bucket);
+	in->src_fn = src_fn;
+	in->src_arg = src_arg;
+	ctx->ingest = in;
+	ctx->bs_dev.copy_on_materialize_only = true;
+	ctx->bs_dev.copy = s3_bs_dev_copy;
+	return 0;
+}
+
+static void
+ingest_prefetch_work(struct s3_ctx *ctx, uint64_t src_lba, uint64_t lba_count)
+{
+	struct s3_ingest *in = ctx->ingest;
+	uint32_t bpc;
+	uint64_t pos = 0;
+
+	if (!in || in->ending) {
+		return;
+	}
+	bpc = s3_blocks_per_chunk(ctx);
+
+	while (pos < lba_count) {
+		uint64_t src_chunk;
+		struct s3_ingest_slot *slot;
+
+		if (s3_lba_offset_in_chunk(src_lba + pos, ctx->chunk_shift) != 0) {
+			return;
+		}
+		src_chunk = s3_lba_to_chunk_index(src_lba + pos, ctx->chunk_shift);
+		slot = ingest_find_slot(in, src_chunk, true);
+		if (slot && slot->state == S3_INGEST_FREE) {
+			slot->ctx = ctx;
+			if (ingest_start_slot(slot, src_chunk) != 0) {
+				return;
+			}
+		}
+		pos += bpc;
+	}
+}
+
+static void
+ingest_prefetch_on_owner(void *arg)
+{
+	struct ingest_prefetch_msg *m = arg;
+
+	ingest_prefetch_work(m->ctx, m->src_lba, m->lba_count);
+	free(m);
+}
+
+void
+s3_bs_dev_ingest_prefetch(struct spdk_bs_dev *bs_dev, uint64_t src_lba,
+			  uint64_t lba_count)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct ingest_prefetch_msg *m;
+	int rc;
+
+	if (!ctx || !ctx->ingest || lba_count == 0) {
+		return;
+	}
+	if (ctx->owner_thread == NULL ||
+	    ctx->owner_thread == spdk_get_thread()) {
+		ingest_prefetch_work(ctx, src_lba, lba_count);
+		return;
+	}
+	m = calloc(1, sizeof(*m));
+	if (!m) {
+		return;
+	}
+	m->ctx = ctx;
+	m->src_lba = src_lba;
+	m->lba_count = lba_count;
+	rc = spdk_thread_send_msg(ctx->owner_thread, ingest_prefetch_on_owner, m);
+	if (rc != 0) {
+		free(m);
+	}
+}
+
+void
+s3_bs_dev_ingest_end(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_ingest *in;
+
+	if (!ctx || !ctx->ingest) {
+		if (cb_fn) {
+			cb_fn(cb_arg, 0);
+		}
+		return;
+	}
+
+	in = ctx->ingest;
+	in->ending = true;
+	in->end_cb = cb_fn;
+	in->end_arg = cb_arg;
+	ingest_try_finish_end(ctx);
 }
 
 static bool
@@ -2249,28 +4155,6 @@ s3_flush_map_updated(void *cb_arg, const struct spdk_uuid *old_uuid, int status)
 		return;
 	}
 
-	/* The chunk is in S3 and published, and its whole content is still in the
-	 * buffer that was uploaded. Hand it to the cache before that buffer goes.
-	 *
-	 * This is the populate worth having. Without it a chunk's read latency
-	 * *jumps* the instant its flush succeeds: the overlay releases the blocks it
-	 * was serving reads from (s3_overlay.c, on flush success), so the next read
-	 * of data that was local a moment ago costs a full S3 round trip. A
-	 * filesystem notices immediately -- inode blocks and directory blocks are
-	 * written and then read back straight away.
-	 *
-	 * Free, apart from one local write: no GET, and the merge that produced
-	 * these bytes had to happen anyway.
-	 *
-	 * Skipped while tearing down. Teardown waits for cache fills to land before
-	 * freeing anything (s3_bs_dev_teardown), and starting new ones underneath it
-	 * would make that wait unbounded. */
-	if (ctx->cache && !ctx->destroying) {
-		s3_cache_populate(ctx->cache, fc->view->chunk_index,
-				  &fc->new_uuid, 0, fc->chunk_buf, fc->put_len,
-				  fc->put_len);
-	}
-
 	if (!spdk_uuid_is_null(old_uuid)) {
 		char old_key[S3_KEY_MAX];
 		int rc;
@@ -2331,6 +4215,17 @@ s3_flush_put_done(void *cb_arg, int status)
 		return;
 	}
 
+	/* Start populating the cache before publishing the new mapping in the
+	 * chunk map. The chunk remains live in the overlay until the journal
+	 * write finishes, so off-owner readers stay off the new uuid while its
+	 * local-device cache write is in flight. */
+	if (ctx->cache &&
+	    !__atomic_load_n(&ctx->destroying, __ATOMIC_ACQUIRE)) {
+		s3_cache_populate(ctx->cache, fc->view->chunk_index,
+				  &fc->new_uuid, 0, fc->chunk_buf, fc->put_len,
+				  fc->put_len);
+	}
+
 	s3_chunk_map_insert(ctx->chunk_map, fc->view->chunk_index, &fc->new_uuid,
 			    fc->put_len, s3_flush_map_updated, fc);
 }
@@ -2346,7 +4241,7 @@ s3_flush_put(struct s3_flush_ctx *fc)
 	/* Overlay goes on last so it wins over whatever the old object held. */
 	s3_overlay_flush_merge(ctx->overlay, fc->view, fc->chunk_buf);
 
-	/* create-once (P2): a fresh uuid every time, never an in-place update. */
+	/* create-once: a fresh uuid every time, never an in-place update. */
 	spdk_uuid_generate(&fc->new_uuid);
 	s3_data_key(ctx, &fc->new_uuid, key, sizeof(key));
 
@@ -2402,6 +4297,39 @@ s3_flush_base_missing(struct s3_flush_ctx *fc)
 		       fc->view->chunk_index, base_str, now_str);
 }
 
+static void s3_flush_base_read_done(void *cb_arg, uint64_t bytes_read, int status);
+
+static void
+s3_flush_base_s3_get(struct s3_flush_ctx *fc)
+{
+	struct s3_ctx *ctx = fc->ctx;
+	char key[S3_KEY_MAX];
+	int rc;
+
+	s3_data_key(ctx, &fc->base_uuid, key, sizeof(key));
+	rc = s3_get_range(ctx->client, key, 0, fc->base_valid,
+			  fc->chunk_buf, s3_flush_base_read_done, fc);
+	if (rc != 0) {
+		s3_flush_finish(fc, rc);
+	}
+}
+
+static void
+s3_flush_base_cache_done(void *cb_arg, int status)
+{
+	struct s3_flush_ctx *fc = cb_arg;
+	struct s3_ctx *ctx = fc->ctx;
+
+	if (status != 0) {
+		/* A local cache read failure is non-fatal: fall back to S3. */
+		memset(fc->chunk_buf, 0, ctx->chunk_size);
+		s3_flush_base_s3_get(fc);
+		return;
+	}
+
+	s3_flush_put(fc);
+}
+
 static void
 s3_flush_base_read_done(void *cb_arg, uint64_t bytes_read, int status)
 {
@@ -2436,7 +4364,6 @@ s3_flush_upload(void *vctx, const struct s3_overlay_flush_view *view,
 	struct s3_flush_ctx *fc;
 	struct spdk_uuid uuid;
 	uint32_t valid_bytes = 0;
-	char key[S3_KEY_MAX];
 	int rc;
 
 	assert(ctx->owner_thread == NULL || ctx->owner_thread == spdk_get_thread());
@@ -2480,12 +4407,20 @@ s3_flush_upload(void *vctx, const struct s3_overlay_flush_view *view,
 	    !(view->covers_prefix && view->end_offset >= fc->base_valid)) {
 		ctx->rmw_count++;
 
-		s3_data_key(ctx, &fc->base_uuid, key, sizeof(key));
-		rc = s3_get_range(ctx->client, key, 0, fc->base_valid,
-				  fc->chunk_buf, s3_flush_base_read_done, fc);
-		if (rc != 0) {
-			s3_flush_finish(fc, rc);
+		if (ctx->cache) {
+			uint32_t aligned_len =
+				SPDK_ALIGN_CEIL(fc->base_valid, S3LVOL_BLOCK_SIZE);
+
+			if (aligned_len > 0 && aligned_len <= ctx->chunk_size &&
+			    s3_cache_read(ctx->cache, view->chunk_index,
+					  &fc->base_uuid, 0, aligned_len,
+					  fc->chunk_buf,
+					  s3_flush_base_cache_done, fc) == 0) {
+				return;
+			}
 		}
+
+		s3_flush_base_s3_get(fc);
 		return;
 	}
 
@@ -2500,8 +4435,6 @@ s3_flush_upload(void *vctx, const struct s3_overlay_flush_view *view,
 
 int
 s3_bs_dev_create(const struct s3_lvs_opts *opts,
-		 struct spdk_bdev_desc *wal_desc,
-		 struct spdk_bdev_desc *cache_desc,
 		 struct s3_client *client,
 		 uint64_t capacity_bytes,
 		 struct spdk_bs_dev **out)
@@ -2510,11 +4443,6 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 	uint32_t chunk_size;
 	uint64_t blockcnt;
 	int rc;
-
-	/* The direct-to-S3 path has no WAL / cache yet. The parameters are
-	 * accepted but unused to keep the interface stable. */
-	(void)wal_desc;
-	(void)cache_desc;
 
 	if (!opts || !client || !out) {
 		return -EINVAL;
@@ -2555,6 +4483,9 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 	ctx->chunk_size     = chunk_size;
 	ctx->chunk_shift    = (uint32_t)spdk_u32log2(chunk_size);
 	ctx->capacity_bytes = capacity_bytes;
+	ctx->cache_hot_bufs = opts->cache_hot_bufs;
+	ctx->writeback_capacity_bytes =
+		(uint64_t)opts->writeback_size_mb * 1024 * 1024;
 	ctx->owner_thread   = spdk_get_thread();
 
 	ctx->ckpt_interval_sec = opts->checkpoint_interval_sec ?
@@ -2563,9 +4494,16 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 	ctx->ckpt_interval_tsc = ctx->ckpt_interval_sec * spdk_get_ticks_hz();
 
 	STAILQ_INIT(&ctx->retry_q);
+	TAILQ_INIT(&ctx->read_fills);
+	rc = pthread_mutex_init(&ctx->read_fill_lock, NULL);
+	if (rc != 0) {
+		free(ctx);
+		return -rc;
+	}
 
 	ctx->prefix = strdup(opts->lvs_name ? opts->lvs_name : "s3lvol");
 	if (!ctx->prefix) {
+		pthread_mutex_destroy(&ctx->read_fill_lock);
 		free(ctx);
 		return -ENOMEM;
 	}
@@ -2574,6 +4512,7 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 				 &ctx->chunk_map);
 	if (rc != 0) {
 		free(ctx->prefix);
+		pthread_mutex_destroy(&ctx->read_fill_lock);
 		free(ctx);
 		return rc;
 	}
@@ -2615,12 +4554,6 @@ s3_bs_dev_create(const struct s3_lvs_opts *opts,
 	return 0;
 }
 
-struct s3_ctx *
-s3_bs_dev_get_ctx(struct spdk_bs_dev *bs_dev)
-{
-	return (struct s3_ctx *)bs_dev;
-}
-
 /* ==========================================================================
  * WAL attachment
  * ========================================================================== */
@@ -2648,15 +4581,46 @@ s3_bs_dev_attach_wal(struct spdk_bs_dev *bs_dev, struct s3_wal *wal,
 		return rc;
 	}
 
+	{
+		const struct s3_super_block *sb = ctx->local_dev ?
+			s3_local_dev_get_super(ctx->local_dev) : NULL;
+		struct s3_writeback_opts wb_opts = {
+			.lvstore_name = ctx->prefix,
+			.capacity_bytes = ctx->writeback_capacity_bytes,
+			.instance_id = sb && !spdk_uuid_is_null(&sb->lvs_uuid) ?
+				sb->lvs_uuid.u.raw : NULL,
+			.flags = S3_WRITEBACK_OPEN_CREATE,
+		};
+
+		rc = s3_writeback_open(&wb_opts, &ctx->writeback);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to open the shared write-back cache for "
+				    "'%s': %d\n", ctx->prefix, rc);
+			s3_overlay_destroy(ctx->overlay);
+			ctx->overlay = NULL;
+			return rc;
+		}
+		/* A crash after marking a record complete but before advancing
+		 * the ring head leaves harmless completed records behind. */
+		(void)s3_writeback_reclaim_and_wake(ctx);
+	}
+
 	rc = s3_flusher_create(ctx->overlay, wal, s3_flush_upload, ctx, opts,
 			       &ctx->flusher);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to start the flusher: %d\n", rc);
+		s3_writeback_close(ctx->writeback);
+		ctx->writeback = NULL;
+		(void)s3_writeback_cleanup(ctx->prefix);
 		s3_overlay_destroy(ctx->overlay);
 		ctx->overlay = NULL;
 		return rc;
 	}
+	s3_flusher_set_writeback(ctx->flusher, ctx->writeback);
 
+	/* attach_wal() is atomic with respect to the write path: a WAL is never
+	 * visible without the shm ring that owns ordinary write payloads. */
+	assert(ctx->writeback != NULL);
 	ctx->wal = wal;
 
 	SPDK_NOTICELOG("s3_bs_dev '%s' switched to the WAL write path\n",
@@ -2666,11 +4630,381 @@ s3_bs_dev_attach_wal(struct spdk_bs_dev *bs_dev, struct s3_wal *wal,
 }
 
 int
+s3_bs_dev_bind_writeback_instance(struct spdk_bs_dev *bs_dev,
+				  const struct spdk_uuid *lvs_uuid)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx || !ctx->writeback || !lvs_uuid ||
+	    spdk_uuid_is_null(lvs_uuid)) {
+		return -EINVAL;
+	}
+	return s3_writeback_bind_instance(ctx->writeback,
+					  lvs_uuid->u.raw);
+}
+
+struct s3_writeback_recovery;
+
+struct s3_writeback_recovery_op {
+	struct s3_writeback_recovery *recovery;
+	struct s3_writeback_record record;
+	uint64_t wal_seq;
+	bool active;
+	bool submitting;
+	bool completion_seen;
+	int completion_status;
+	int bind_status;
+};
+
+struct s3_writeback_recovery {
+	struct s3_ctx *ctx;
+	struct s3_writeback_iter iter;
+	struct s3_writeback_recovery_op ops[S3_WAL_BATCH_MAX_OPS];
+	uint32_t active_ops;
+	bool iter_done;
+	bool pumping;
+	bool pump_again;
+	bool admission_blocked;
+	bool need_rebind;
+	int status;
+	s3_bs_dev_cb cb_fn;
+	void *cb_arg;
+};
+
+static void s3_writeback_recovery_pump(struct s3_writeback_recovery *recovery);
+static void s3_writeback_recovery_submit(void *arg);
+
+static void
+s3_writeback_recovery_finish(struct s3_writeback_recovery *recovery, int status)
+{
+	s3_bs_dev_cb cb_fn = recovery->cb_fn;
+	void *cb_arg = recovery->cb_arg;
+
+	free(recovery);
+	if (cb_fn) {
+		cb_fn(cb_arg, status);
+	}
+}
+
+static void
+s3_writeback_recovery_fail(struct s3_writeback_recovery *recovery, int status)
+{
+	if (recovery->status == 0) {
+		recovery->status = status != 0 ? status : -EIO;
+	}
+	recovery->iter_done = true;
+}
+
+static void
+s3_writeback_recovery_release(struct s3_writeback_recovery_op *op)
+{
+	struct s3_writeback_recovery *recovery = op->recovery;
+
+	assert(op->active);
+	assert(recovery->active_ops > 0);
+	op->active = false;
+	recovery->active_ops--;
+	s3_writeback_recovery_pump(recovery);
+}
+
+static void
+s3_writeback_recovery_unmap_done(void *cb_arg, const struct spdk_uuid *old_uuid,
+				 int status)
+{
+	struct s3_writeback_recovery_op *op = cb_arg;
+	struct s3_writeback_recovery *recovery = op->recovery;
+	int rc;
+
+	(void)old_uuid;
+	recovery->admission_blocked = false;
+	if (status != 0 && status != -ENOENT) {
+		s3_writeback_recovery_fail(recovery, status);
+		s3_writeback_recovery_release(op);
+		return;
+	}
+	rc = s3_writeback_mark_record_complete(recovery->ctx->writeback,
+						&op->record, 0);
+	if (rc != 0 && rc != -EALREADY) {
+		s3_writeback_recovery_fail(recovery, rc);
+		s3_writeback_recovery_release(op);
+		return;
+	}
+	(void)s3_writeback_reclaim_and_wake(recovery->ctx);
+	s3_writeback_recovery_release(op);
+}
+
+static void
+s3_writeback_recovery_submit(void *arg)
+{
+	struct s3_writeback_recovery_op *op = arg;
+	struct s3_writeback_recovery *recovery = op->recovery;
+	struct s3_writeback_record *record = &op->record;
+	struct s3_ctx *ctx = recovery->ctx;
+	struct s3_wal_entry_hdr hdr = {0};
+	struct s3_writeback_wal_op *wop;
+	int rc;
+
+	if (recovery->status != 0) {
+		s3_writeback_recovery_release(op);
+		return;
+	}
+
+	/* Not in the on-disk log.  Republish from shm and let the flusher
+	 * upload it.  Re-appending would put the payload back on the HDD.
+	 * Once recovery assigns a new sequence to an unbound record, later
+	 * records from an older WAL epoch must also be rebound so overlay
+	 * sequence ordering remains monotonic. */
+	if (record->wal_seq == 0) {
+		recovery->need_rebind = true;
+	} else if (recovery->need_rebind &&
+		   record->wal_seq < s3_wal_get_next_seq(ctx->wal)) {
+		record->wal_seq = 0;
+	}
+	rc = s3_writeback_assign_seq(ctx, record, &op->wal_seq);
+	if (rc != 0) {
+		s3_writeback_recovery_fail(recovery, rc);
+		s3_writeback_recovery_release(op);
+		return;
+	}
+
+	switch (record->type) {
+	case S3_WRITEBACK_WRITE:
+		rc = s3_writeback_overlay_publish_recovered(ctx, record,
+							    op->wal_seq);
+		if (rc != 0) {
+			s3_writeback_recovery_fail(recovery, rc);
+		} else {
+			s3_flusher_kick(ctx->flusher);
+		}
+		s3_writeback_recovery_release(op);
+		return;
+	case S3_WRITEBACK_ZEROES:
+		wop = calloc(1, sizeof(*wop));
+		if (!wop) {
+			s3_writeback_recovery_fail(recovery, -ENOMEM);
+			s3_writeback_recovery_release(op);
+			return;
+		}
+		wop->ctx = ctx;
+		wop->record = *record;
+		wop->writeback_seq = record->seq;
+		wop->wal_seq = op->wal_seq;
+		wop->lba = record->lba;
+		wop->chunk_index = record->chunk_index;
+		wop->nblocks = record->nblocks;
+		rc = s3_writeback_install_zeroes(ctx, wop);
+		if (rc != 0) {
+			s3_writeback_recovery_fail(recovery, rc);
+		}
+		s3_writeback_recovery_release(op);
+		return;
+	case S3_WRITEBACK_UNMAP:
+		hdr.magic = S3_WAL_ENTRY_MAGIC;
+		hdr.type = S3_WAL_UNMAP;
+		hdr.seq = op->wal_seq;
+		hdr.lba = record->lba;
+		hdr.nblocks = record->nblocks;
+		hdr.chunk_index = record->chunk_index;
+		rc = s3_bs_dev_wal_apply(&ctx->bs_dev, &hdr, NULL);
+		if (rc != 0) {
+			s3_writeback_recovery_fail(recovery, rc);
+			s3_writeback_recovery_release(op);
+			return;
+		}
+		recovery->admission_blocked = true;
+		s3_chunk_map_remove(ctx->chunk_map, record->chunk_index,
+				    s3_writeback_recovery_unmap_done, op);
+		return;
+	default:
+		s3_writeback_recovery_fail(recovery, -EILSEQ);
+		s3_writeback_recovery_release(op);
+		return;
+	}
+}
+
+static struct s3_writeback_recovery_op *
+s3_writeback_recovery_get_op(struct s3_writeback_recovery *recovery)
+{
+	uint32_t i;
+
+	for (i = 0; i < S3_WAL_BATCH_MAX_OPS; i++) {
+		if (!recovery->ops[i].active) {
+			return &recovery->ops[i];
+		}
+	}
+	return NULL;
+}
+
+static bool
+s3_writeback_recovery_record_valid(
+	const struct s3_writeback_recovery *recovery,
+	const struct s3_writeback_record *record)
+{
+	return record->lba < recovery->ctx->bs_dev.blockcnt &&
+	       record->nblocks <= recovery->ctx->bs_dev.blockcnt - record->lba &&
+	       ((record->type == S3_WRITEBACK_WRITE &&
+		 record->payload_len == (uint64_t)record->nblocks *
+					recovery->ctx->bs_dev.blocklen) ||
+		(record->type != S3_WRITEBACK_WRITE &&
+		 record->payload_len == 0)) &&
+	       record->chunk_index ==
+		       s3_lba_to_chunk_index(record->lba,
+					     recovery->ctx->chunk_shift) &&
+	       record->nblocks <=
+		       s3_blocks_per_chunk(recovery->ctx) -
+			       (record->lba %
+				s3_blocks_per_chunk(recovery->ctx));
+}
+
+static void
+s3_writeback_recovery_pump(struct s3_writeback_recovery *recovery)
+{
+	struct s3_writeback_recovery_op *op;
+	struct s3_writeback_record record;
+	int rc;
+
+	if (recovery->pumping) {
+		recovery->pump_again = true;
+		return;
+	}
+	recovery->pumping = true;
+
+	do {
+		recovery->pump_again = false;
+		while (!recovery->iter_done &&
+		       !recovery->admission_blocked &&
+		       recovery->active_ops < S3_WAL_BATCH_MAX_OPS) {
+			rc = s3_writeback_iter_next(recovery->ctx->writeback,
+						    &recovery->iter, &record);
+			if (rc < 0) {
+				s3_writeback_recovery_fail(recovery, rc);
+				break;
+			}
+			if (rc == 0) {
+				recovery->iter_done = true;
+				break;
+			}
+			if (!s3_writeback_recovery_record_valid(recovery,
+								&record)) {
+				s3_writeback_recovery_fail(recovery, -EILSEQ);
+				break;
+			}
+
+			/* WAL replay has already applied this record (or its
+			 * sequence was safely truncated after reaching S3).
+			 * Re-appending it would let an old write overwrite newer
+			 * data under a newly assigned sequence. */
+			if (s3_wal_seq_recovered(recovery->ctx->wal,
+						 record.wal_seq)) {
+				if (record.type == S3_WRITEBACK_WRITE &&
+				    !s3_wal_seq_checkpointed(
+					    recovery->ctx->wal,
+					    record.wal_seq) &&
+				    s3_overlay_data_matches_seq(
+					    recovery->ctx->overlay, record.lba,
+					    record.nblocks, record.wal_seq)) {
+					rc = s3_writeback_overlay_publish_recovered(
+						recovery->ctx, &record,
+						record.wal_seq);
+					if (rc != 0) {
+						s3_writeback_recovery_fail(
+							recovery, rc);
+						break;
+					}
+					/* The overlay token retires the shm
+					 * record after its last borrowed block
+					 * reference is released. */
+					continue;
+				}
+				rc = s3_writeback_mark_record_complete(
+					recovery->ctx->writeback, &record, 0);
+				if (rc != 0 && rc != -EALREADY) {
+					s3_writeback_recovery_fail(recovery, rc);
+					break;
+				}
+				(void)s3_writeback_reclaim_and_wake(
+					recovery->ctx);
+				continue;
+			}
+
+			op = s3_writeback_recovery_get_op(recovery);
+			assert(op != NULL);
+			op->record = record;
+			op->active = true;
+			recovery->active_ops++;
+			s3_writeback_recovery_submit(op);
+		}
+	} while (recovery->pump_again && recovery->status == 0);
+
+	recovery->pumping = false;
+	if (recovery->iter_done && recovery->active_ops == 0) {
+		if (recovery->status == 0) {
+			s3_flusher_kick(recovery->ctx->flusher);
+		}
+		s3_writeback_recovery_finish(recovery, recovery->status);
+	}
+}
+
+void
+s3_bs_dev_recover_writeback(struct spdk_bs_dev *bs_dev,
+			    s3_bs_dev_cb cb_fn, void *cb_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_writeback_recovery *recovery;
+
+	if (!ctx || !ctx->wal || !ctx->writeback) {
+		if (cb_fn) {
+			cb_fn(cb_arg, ctx ? 0 : -EINVAL);
+		}
+		return;
+	}
+	assert(ctx->owner_thread == NULL || ctx->owner_thread == spdk_get_thread());
+
+	recovery = calloc(1, sizeof(*recovery));
+	if (!recovery) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+	recovery->ctx = ctx;
+	recovery->cb_fn = cb_fn;
+	recovery->cb_arg = cb_arg;
+	s3_writeback_iter_begin(ctx->writeback, &recovery->iter);
+	for (uint32_t i = 0; i < S3_WAL_BATCH_MAX_OPS; i++) {
+		recovery->ops[i].recovery = recovery;
+	}
+	s3_writeback_recovery_pump(recovery);
+}
+
+void
+s3_bs_dev_log_overlay(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_overlay_stats st = {0};
+
+	if (!ctx || !ctx->overlay) {
+		SPDK_NOTICELOG("overlay: none\n");
+		return;
+	}
+
+	s3_overlay_get_stats(ctx->overlay, &st);
+	SPDK_NOTICELOG("overlay: %" PRIu64 " bytes in %" PRIu64 " live chunks, "
+		       "writes=%" PRIu64 " blocks_written=%" PRIu64
+		       " blocks_dropped=%" PRIu64 " peak_bytes=%" PRIu64 "\n",
+		       s3_overlay_get_bytes(ctx->overlay),
+		       s3_overlay_get_live_chunks(ctx->overlay),
+		       st.writes, st.blocks_written, st.blocks_dropped,
+		       st.peak_bytes);
+}
+
+int
 s3_bs_dev_attach_cache(struct spdk_bs_dev *bs_dev)
 {
 	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
 	const struct s3_region *region;
 	struct s3_cache_opts opts = {};
+	struct s3_cache *cache = NULL;
 	int rc;
 
 	if (!ctx) {
@@ -2702,6 +5036,7 @@ s3_bs_dev_attach_cache(struct spdk_bs_dev *bs_dev)
 	opts.region_size   = region->size;
 	opts.chunk_size    = ctx->chunk_size;
 	opts.block_size    = S3LVOL_BLOCK_SIZE;
+	opts.hot_bufs      = ctx->cache_hot_bufs;
 	opts.num_chunks    = s3_chunk_map_get_num_chunks(ctx->chunk_map);
 
 	if (!opts.desc || !opts.ch) {
@@ -2710,18 +5045,26 @@ s3_bs_dev_attach_cache(struct spdk_bs_dev *bs_dev)
 		return -ENOTSUP;
 	}
 
-	rc = s3_cache_create(&opts, &ctx->cache);
+	rc = s3_cache_create(&opts, &cache);
 	if (rc != 0) {
 		/* Not fatal: an lvstore without a cache is the behaviour that
 		 * shipped before there was one. Say so and carry on. */
 		SPDK_WARNLOG("Could not create the chunk cache for '%s': %s; "
 			     "reads will always go to S3\n",
 			     ctx->prefix, spdk_strerror(-rc));
-		ctx->cache = NULL;
 		return rc;
 	}
+	__atomic_store_n(&ctx->cache, cache, __ATOMIC_RELEASE);
 
 	return 0;
+}
+
+struct s3_cache *
+s3_bs_dev_get_cache(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	return ctx ? __atomic_load_n(&ctx->cache, __ATOMIC_ACQUIRE) : NULL;
 }
 
 void
@@ -2755,10 +5098,41 @@ s3_bs_dev_set_reap_cb(struct spdk_bs_dev *bs_dev, s3_bs_dev_reap_cb cb_fn,
 	ctx->reap_arg = cb_arg;
 }
 
+struct s3_bs_drain_req {
+	struct s3_ctx *ctx;
+	uint64_t timeout_us;
+	s3_bs_dev_cb cb_fn;
+	void *cb_arg;
+};
+
+static void
+s3_bs_dev_drain_wal_done(void *cb_arg, int status)
+{
+	struct s3_bs_drain_req *req = cb_arg;
+	s3_bs_dev_cb cb_fn;
+	void *user_arg;
+
+	if (status == 0) {
+		s3_flusher_drain(req->ctx->flusher, req->timeout_us,
+				 req->cb_fn, req->cb_arg);
+		free(req);
+		return;
+	}
+
+	cb_fn = req->cb_fn;
+	user_arg = req->cb_arg;
+	free(req);
+	if (cb_fn) {
+		cb_fn(user_arg, status);
+	}
+}
+
 void
-s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
+s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+		s3_bs_dev_cb cb_fn, void *cb_arg)
 {
 	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+	struct s3_bs_drain_req *req;
 
 	if (!ctx || !ctx->flusher) {
 		/* Direct-to-S3 mode: a completed write is already in S3. */
@@ -2770,7 +5144,76 @@ s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg)
 
 	assert(ctx->owner_thread == NULL || ctx->owner_thread == spdk_get_thread());
 
-	s3_flusher_drain(ctx->flusher, 0, cb_fn, cb_arg);
+	/* Ordinary writes complete from shared memory, so make the WAL boundary
+	 * explicit before asking the S3 flusher to drain the now-durable overlay. */
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+	req->ctx = ctx;
+	req->timeout_us = timeout_us;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	s3_bs_dev_wal_flush(bs_dev, s3_bs_dev_drain_wal_done, req);
+}
+
+void
+s3_bs_dev_suspend_flusher(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+			  s3_bs_dev_cb cb_fn, void *cb_arg)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx || !ctx->flusher) {
+		if (cb_fn) {
+			cb_fn(cb_arg, 0);
+		}
+		return;
+	}
+	s3_flusher_suspend(ctx->flusher, timeout_us, cb_fn, cb_arg);
+}
+
+void
+s3_bs_dev_resume_flusher(struct spdk_bs_dev *bs_dev)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (ctx && ctx->flusher) {
+		if (ctx->flusher_resume_poller) {
+			spdk_poller_unregister(&ctx->flusher_resume_poller);
+		}
+		s3_flusher_resume(ctx->flusher);
+	}
+}
+
+static int
+s3_bs_dev_resume_flusher_poller(void *arg)
+{
+	struct s3_ctx *ctx = arg;
+
+	spdk_poller_unregister(&ctx->flusher_resume_poller);
+	s3_flusher_resume(ctx->flusher);
+	return SPDK_POLLER_BUSY;
+}
+
+void
+s3_bs_dev_schedule_flusher_resume(struct spdk_bs_dev *bs_dev, uint64_t delay_us)
+{
+	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
+
+	if (!ctx || !ctx->flusher) {
+		return;
+	}
+	if (ctx->flusher_resume_poller) {
+		spdk_poller_unregister(&ctx->flusher_resume_poller);
+	}
+	ctx->flusher_resume_poller = SPDK_POLLER_REGISTER(
+		s3_bs_dev_resume_flusher_poller, ctx, delay_us);
+	if (!ctx->flusher_resume_poller) {
+		s3_flusher_resume(ctx->flusher);
+	}
 }
 
 int
@@ -2900,7 +5343,7 @@ ckpt_finish(struct s3_ctx *ctx, int status)
 	/* Last, because it ends in ctx being freed. A destroy that arrived while this
 	 * checkpoint was running parked itself here rather than tearing down around
 	 * it -- see s3_bs_dev_teardown(). */
-	if (ctx->destroying) {
+	if (__atomic_load_n(&ctx->destroying, __ATOMIC_ACQUIRE)) {
 		s3_bs_dev_teardown(ctx);
 	}
 }
@@ -2984,7 +5427,7 @@ ckpt_start(struct s3_ctx *ctx, bool forced)
 	 * caller left here is an explicit request that raced the unload. Refused for
 	 * the same reason the poller was stopped: everything a checkpoint reaches
 	 * through ctx is being freed. */
-	if (ctx->destroying) {
+	if (__atomic_load_n(&ctx->destroying, __ATOMIC_ACQUIRE)) {
 		return -ESHUTDOWN;
 	}
 	if (ctx->ckpt_in_flight) {
@@ -3204,8 +5647,51 @@ s3_bs_dev_get_stats(struct spdk_bs_dev *bs_dev, struct s3_bs_dev_stats *out)
 	out->wal_attached = (ctx->wal != NULL);
 	out->rmw_count        = ctx->rmw_count;
 	out->zero_fill_count  = ctx->zero_fill_count;
+	out->dest_whole_gets =
+		__atomic_load_n(&ctx->dest_whole_gets, __ATOMIC_RELAXED);
+	out->dest_coalesced_reads =
+		__atomic_load_n(&ctx->dest_coalesced_reads, __ATOMIC_RELAXED);
+	out->dest_exact_fallbacks =
+		__atomic_load_n(&ctx->dest_exact_fallbacks, __ATOMIC_RELAXED);
+	out->dest_submit_cache_hits =
+		__atomic_load_n(&ctx->dest_submit_cache_hits, __ATOMIC_RELAXED);
+	out->dest_submit_cache_retries =
+		__atomic_load_n(&ctx->dest_submit_cache_retries, __ATOMIC_RELAXED);
+	out->dest_submit_fill_starts =
+		__atomic_load_n(&ctx->dest_submit_fill_starts, __ATOMIC_RELAXED);
+	out->dest_submit_fill_joins =
+		__atomic_load_n(&ctx->dest_submit_fill_joins, __ATOMIC_RELAXED);
+	out->dest_direct_gets =
+		__atomic_load_n(&ctx->dest_direct_gets, __ATOMIC_RELAXED);
+	out->dest_direct_get_bytes =
+		__atomic_load_n(&ctx->dest_direct_get_bytes, __ATOMIC_RELAXED);
 	out->wal_writes       = ctx->wal_writes;
 	out->wal_retries      = ctx->wal_retries;
+	if (ctx->wal) {
+		struct s3_wal_stats wstats = {};
+
+		s3_wal_get_stats(ctx->wal, &wstats);
+		out->wal_appends       = wstats.appends;
+		out->wal_batches       = wstats.batches;
+		out->wal_bytes_written = wstats.bytes_written;
+	}
+	if (ctx->writeback) {
+		struct s3_writeback_stats wbstats = {};
+
+		if (s3_writeback_get_stats(ctx->writeback, &wbstats) == 0) {
+			out->writeback_capacity_bytes = wbstats.capacity_bytes;
+			out->writeback_occupied_bytes = wbstats.occupied_bytes;
+			out->writeback_pending_records = wbstats.pending_records;
+			out->writeback_publishes = wbstats.publishes;
+			out->writeback_full_events = wbstats.full_events;
+			out->writeback_global_reserved_bytes =
+				wbstats.global_reserved_bytes;
+			out->writeback_global_limit_bytes =
+				wbstats.global_limit_bytes;
+			out->writeback_global_active_rings =
+				wbstats.global_active_rings;
+		}
+	}
 	out->overlay_hits     = ctx->overlay_hits;
 	out->retry_queued     = ctx->retry_count;
 	out->allocated_chunks = s3_chunk_map_get_allocated(ctx->chunk_map);
@@ -3215,29 +5701,30 @@ s3_bs_dev_get_stats(struct spdk_bs_dev *bs_dev, struct s3_bs_dev_stats *out)
 	out->ckpt_lsn    = ctx->ckpt_lsn_done;
 	out->ckpt_gen    = ctx->ckpt_gen;
 	out->ckpt_interval_sec = ctx->ckpt_interval_sec;
-	{
-		struct s3_journal *j = s3_chunk_map_get_journal(ctx->chunk_map);
 
-		out->journal_used_bytes = s3_journal_get_used_bytes(j);
-		out->journal_capacity_bytes = s3_journal_get_capacity_bytes(j);
-	}
+	struct s3_journal *j = s3_chunk_map_get_journal(ctx->chunk_map);
+	out->journal_used_bytes = s3_journal_get_used_bytes(j);
+	out->journal_capacity_bytes = s3_journal_get_capacity_bytes(j);
 
 	out->overlay_bytes       = s3_overlay_get_bytes(ctx->overlay);
 	out->overlay_live_chunks = s3_overlay_get_live_chunks(ctx->overlay);
-	{
-		struct s3_overlay_stats ostats = {};
 
-		s3_overlay_get_stats(ctx->overlay, &ostats);
-		out->overlay_flushed_full   = ostats.flushed_full;
-		out->overlay_flushed_aged   = ostats.flushed_aged;
-		out->overlay_flushed_forced = ostats.flushed_forced;
-	}
+	struct s3_overlay_stats ostats = {};
+	s3_overlay_get_stats(ctx->overlay, &ostats);
+	out->overlay_flushed_full   = ostats.flushed_full;
+	out->overlay_flushed_aged   = ostats.flushed_aged;
+	out->overlay_flushed_forced = ostats.flushed_forced;
+	out->overlay_flushes_partial = ostats.flushes_partial;
+	out->overlay_flushes_repeated = ostats.flushes_repeated;
+	out->overlay_flushes_repeated_partial =
+		ostats.flushes_repeated_partial;
 
 	if (ctx->flusher) {
 		s3_flusher_get_stats(ctx->flusher, &fstats);
 		out->chunks_flushed  = fstats.chunks_flushed;
 		out->flush_failures  = fstats.failures;
 		out->flush_in_flight = fstats.in_flight;
+		out->overlay_flushed_ring_head = fstats.ring_head_rounds;
 	}
 
 	if (ctx->cache) {
@@ -3246,25 +5733,43 @@ s3_bs_dev_get_stats(struct spdk_bs_dev *bs_dev, struct s3_bs_dev_stats *out)
 		s3_cache_get_stats(ctx->cache, &cstats);
 		out->cache_attached           = true;
 		out->cache_hits               = cstats.hits;
+		out->cache_ram_hits           = cstats.ram_hits;
+		out->cache_disk_hits          = cstats.disk_hits;
 		out->cache_misses             = cstats.misses;
 		out->cache_hits_declined      = cstats.hits_declined;
 		out->cache_populates          = cstats.populates;
 		out->cache_populates_dropped  = cstats.populates_dropped;
+		out->cache_populates_failed   = cstats.populates_failed;
 		out->cache_evictions          = cstats.evictions;
 		out->cache_bytes_served       = cstats.bytes_served;
+		out->cache_ram_bytes_served   = cstats.ram_bytes_served;
 		out->cache_bytes_populated    = cstats.bytes_populated;
 		out->cache_slots_total        = cstats.slots_total;
 		out->cache_slots_resident     = cstats.slots_resident;
 		out->cache_bytes_resident     = cstats.bytes_resident;
+		out->cache_hot_slots_total    = cstats.hot_slots_total;
+		out->cache_hot_slots_resident = cstats.hot_slots_resident;
+		out->cache_hot_evictions      = cstats.hot_evictions;
+		out->cache_object_hits        = cstats.object_hits;
+		out->cache_object_misses      = cstats.object_misses;
+		out->cache_object_hits_declined = cstats.object_hits_declined;
+		out->cache_object_populates   = cstats.object_populates;
+		out->cache_object_populates_dropped =
+			cstats.object_populates_dropped;
+		out->cache_object_populates_failed =
+			cstats.object_populates_failed;
+		out->cache_object_evictions   = cstats.object_evictions;
+		out->cache_object_bytes_served = cstats.object_bytes_served;
+		out->cache_object_bytes_populated =
+			cstats.object_bytes_populated;
+		out->cache_object_slots_resident =
+			cstats.object_slots_resident;
+		out->cache_object_alias_hits = cstats.object_alias_hits;
+		out->cache_object_alias_misses = cstats.object_alias_misses;
+		out->cache_object_alias_registers = cstats.object_alias_registers;
+		out->cache_object_alias_evictions = cstats.object_alias_evictions;
+		out->cache_object_aliases_resident =
+			cstats.object_aliases_resident;
 	}
 }
 
-void
-s3_bs_dev_kick_flusher(struct spdk_bs_dev *bs_dev)
-{
-	struct s3_ctx *ctx = (struct s3_ctx *)bs_dev;
-
-	if (ctx && ctx->flusher) {
-		s3_flusher_kick(ctx->flusher);
-	}
-}

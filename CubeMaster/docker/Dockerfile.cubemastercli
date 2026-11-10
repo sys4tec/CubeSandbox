@@ -22,15 +22,23 @@ ARG CUBE_BUILD_TIME=unknown
 WORKDIR /src
 
 COPY CubeMaster/go.mod CubeMaster/go.sum ./
-COPY cubelog/go.mod cubelog/go.sum /cubelog/
-COPY CubeDB/go.mod CubeDB/go.sum /CubeDB/
-COPY Cubelet/go.mod Cubelet/go.sum /Cubelet/
+COPY pkgs/CubeLog/go.mod pkgs/CubeLog/go.sum /pkgs/CubeLog/
+COPY pkgs/blobstore/go.mod pkgs/blobstore/go.sum /pkgs/blobstore/
+COPY pkgs/cubedb/go.mod pkgs/cubedb/go.sum /pkgs/cubedb/
+COPY pkgs/proto/go.mod pkgs/proto/go.sum /pkgs/proto/
+COPY pkgs/sandboxrestart/go.mod /pkgs/sandboxrestart/
+COPY pkgs/redisx/go.mod pkgs/redisx/go.sum /pkgs/redisx/
+COPY pkgs/snapshotmode/go.mod /pkgs/snapshotmode/
 RUN go mod download
 
 COPY CubeMaster/ ./
-COPY cubelog/ /cubelog/
-COPY CubeDB/ /CubeDB/
-COPY Cubelet/ /Cubelet/
+COPY pkgs/CubeLog/ /pkgs/CubeLog/
+COPY pkgs/blobstore/ /pkgs/blobstore/
+COPY pkgs/cubedb/ /pkgs/cubedb/
+COPY pkgs/proto/ /pkgs/proto/
+COPY pkgs/sandboxrestart/ /pkgs/sandboxrestart/
+COPY pkgs/redisx/ /pkgs/redisx/
+COPY pkgs/snapshotmode/ /pkgs/snapshotmode/
 
 ENV CGO_ENABLED=0
 RUN set -eux; \
@@ -49,17 +57,24 @@ RUN set -eux; \
 # ── Build stage: cubeopscli ────────────────────────────────────────────────────
 FROM golang:1.25-bookworm AS builder-ops
 ARG TARGETARCH
+ARG CUBE_VERSION=0.0.0-dev
+ARG CUBE_COMMIT=unknown
+ARG CUBE_BUILD_TIME=unknown
 
 WORKDIR /src
 
 COPY CubeOps/go.mod CubeOps/go.sum ./
-COPY CubeDB/go.mod CubeDB/go.sum /CubeDB/
-COPY cubelog/go.mod cubelog/go.sum /cubelog/
+COPY pkgs/cubedb/go.mod pkgs/cubedb/go.sum /pkgs/cubedb/
+COPY pkgs/CubeLog/go.mod pkgs/CubeLog/go.sum /pkgs/CubeLog/
+COPY pkgs/blobstore/go.mod pkgs/blobstore/go.sum /pkgs/blobstore/
+COPY pkgs/redisx/go.mod pkgs/redisx/go.sum /pkgs/redisx/
 RUN go mod download
 
 COPY CubeOps/ ./
-COPY CubeDB/ /CubeDB/
-COPY cubelog/ /cubelog/
+COPY pkgs/cubedb/ /pkgs/cubedb/
+COPY pkgs/CubeLog/ /pkgs/CubeLog/
+COPY pkgs/blobstore/ /pkgs/blobstore/
+COPY pkgs/redisx/ /pkgs/redisx/
 
 ENV CGO_ENABLED=0
 RUN set -eux; \
@@ -69,7 +84,10 @@ RUN set -eux; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     GOOS=linux GOARCH="${goarch}" go build -o /out/cubeopscli \
-      -ldflags "-s -w" \
+      -ldflags "-s -w \
+        -X 'github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.Version=${CUBE_VERSION}' \
+        -X 'github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.Commit=${CUBE_COMMIT}' \
+        -X 'github.com/tencentcloud/CubeSandbox/CubeOps/internal/version.BuildTime=${CUBE_BUILD_TIME}'" \
       ./cmd/cubeopscli
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────
@@ -81,6 +99,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \
+        tini \
     && rm -rf /var/lib/apt/lists/* \
     && update-ca-certificates
 
@@ -90,6 +109,8 @@ COPY --from=builder-ops    --chmod=0755 /out/cubeopscli   /usr/local/bin/cubeops
 # Fail early if either binary cannot exec in this image.
 RUN ["/usr/local/bin/cubemastercli", "--help"]
 RUN ["/usr/local/bin/cubeopscli", "--help"]
+# tini is the PID 1 the whole Pod depends on; fail the build if missing.
+RUN ["/usr/bin/tini", "--version"]
 
 # Interactive bash helper for kubectl exec -it ... -- bash:
 # inject CUBEMASTERCLI_ADDRESS / CUBEMASTERCLI_PORT when flags are omitted.
@@ -167,4 +188,8 @@ RUN { \
       } >/etc/cubeopscli-interactive.bashrc \
     && printf '\n%s\n' '[ -f /etc/cubeopscli-interactive.bashrc ] && . /etc/cubeopscli-interactive.bashrc' >>/root/.bashrc
 
+# tini runs as PID 1 and reaps orphaned children: kubectl exec / probe
+# invocations of cubemastercli/cubeopscli would otherwise pile up as
+# <defunct> zombies under "sleep infinity", which never calls wait().
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["sleep", "infinity"]

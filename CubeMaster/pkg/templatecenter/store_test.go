@@ -7,6 +7,7 @@ package templatecenter
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -465,7 +466,122 @@ func TestGetTemplateRequestAssignsRuntimeRequestID(t *testing.T) {
 	}
 }
 
+func TestGetTemplateRequestSurfacesAliasAnnotation(t *testing.T) {
+	templateID := "tpl-runtime-alias"
+	invalidateTemplateCaches(templateID)
+	defer invalidateTemplateCaches(templateID)
+
+	cached := &sandboxtypes.CreateCubeSandboxReq{
+		Annotations: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "python-runtime",
+		},
+	}
+	if err := setTemplateRequestCache(templateID, cached); err != nil {
+		t.Fatalf("setTemplateRequestCache returned error: %v", err)
+	}
+
+	req, err := GetTemplateRequest(context.Background(), templateID)
+	if err != nil {
+		t.Fatalf("GetTemplateRequest returned error: %v", err)
+	}
+	if got := req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias]; got != "python-runtime" {
+		t.Fatalf("expected alias annotation python-runtime, got %q", got)
+	}
+}
+
+func TestGetTemplateRequestStampsSnapshotDisplayNameAsAlias(t *testing.T) {
+	snapshotID := "snap-alias-stamp"
+	invalidateTemplateCaches(snapshotID)
+	defer invalidateTemplateCaches(snapshotID)
+
+	// The stored snapshot request still carries the source template's alias.
+	stored := &sandboxtypes.CreateCubeSandboxReq{
+		Request: &sandboxtypes.Request{RequestID: "req-1"},
+		Annotations: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-template-alias",
+		},
+		Labels: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-template-alias",
+		},
+	}
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored request: %v", err)
+	}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(getSnapshotRecord, func(ctx context.Context, id string) (*models.SnapshotRecord, error) {
+		return &models.SnapshotRecord{
+			SnapshotID:  id,
+			DisplayName: "my-snap",
+			RequestJSON: string(storedJSON),
+			Status:      StatusReady,
+		}, nil
+	})
+
+	req, err := GetTemplateRequest(context.Background(), snapshotID)
+	if err != nil {
+		t.Fatalf("GetTemplateRequest returned error: %v", err)
+	}
+	if got := req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias]; got != "my-snap" {
+		t.Fatalf("expected snapshot name my-snap as alias, got %q", got)
+	}
+	if _, ok := req.Labels[constants.CubeAnnotationAppSnapshotTemplateAlias]; ok {
+		t.Fatal("inherited source template alias must be scrubbed from labels")
+	}
+}
+
+// TestGetTemplateRequestClearsStaleAliasWhenDisplayNameEmpty verifies the
+// definition read path scrubs a leaked alias when display_name is empty.
+func TestGetTemplateRequestClearsStaleAliasWhenDisplayNameEmpty(t *testing.T) {
+	templateID := "tpl-alias-clear"
+	invalidateTemplateCaches(templateID)
+	defer invalidateTemplateCaches(templateID)
+
+	// The definition's request_json still carries a stale alias from the
+	// source template, but the definition itself has no display_name.
+	stored := &sandboxtypes.CreateCubeSandboxReq{
+		Annotations: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-alias",
+		},
+		Labels: map[string]string{
+			constants.CubeAnnotationAppSnapshotTemplateAlias: "source-alias",
+		},
+	}
+	storedJSON, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("marshal stored request: %v", err)
+	}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(getSnapshotRecord, func(ctx context.Context, id string) (*models.SnapshotRecord, error) {
+		return nil, ErrSnapshotNotFound
+	})
+	patches.ApplyFunc(GetDefinition, func(ctx context.Context, id string) (*models.TemplateDefinition, error) {
+		return &models.TemplateDefinition{
+			TemplateID:  id,
+			DisplayName: "",
+			RequestJSON: string(storedJSON),
+		}, nil
+	})
+
+	req, err := GetTemplateRequest(context.Background(), templateID)
+	if err != nil {
+		t.Fatalf("GetTemplateRequest returned error: %v", err)
+	}
+	if _, ok := req.Annotations[constants.CubeAnnotationAppSnapshotTemplateAlias]; ok {
+		t.Fatal("stale alias annotation must be scrubbed when display_name is empty")
+	}
+	if _, ok := req.Labels[constants.CubeAnnotationAppSnapshotTemplateAlias]; ok {
+		t.Fatal("stale alias label must be scrubbed when display_name is empty")
+	}
+}
+
 func TestGetTemplateInfoPopulatesCreatedAtAndImageInfoFromDefinitionAndLatestJob(t *testing.T) {
+	stubSweepStore(t)
+
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
@@ -487,7 +603,7 @@ func TestGetTemplateInfoPopulatesCreatedAtAndImageInfoFromDefinitionAndLatestJob
 	patches.ApplyFunc(ListReplicas, func(ctx context.Context, templateID string) ([]models.TemplateReplica, error) {
 		return nil, nil
 	})
-	patches.ApplyFunc(getLatestTemplateImageJobByTemplateID, func(ctx context.Context, templateID string) (*models.TemplateImageJob, error) {
+	patches.ApplyFunc(getLatestCreateRedoImageJobByTemplateIDTx, func(tx *gorm.DB, templateID string) (*models.TemplateImageJob, error) {
 		return &models.TemplateImageJob{
 			TemplateID:        templateID,
 			SourceImageRef:    "docker.io/library/python:3.12",
@@ -792,8 +908,8 @@ func TestIsDeadlockError(t *testing.T) {
 	assert.True(t, isDeadlockError(&mysql.MySQLError{Number: 1205, Message: "Lock wait timeout exceeded"}))
 	assert.True(t, isDeadlockError(&mysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock"}))
 	assert.True(t, isDeadlockError(fmt.Errorf("claim fail: %w", &mysql.MySQLError{Number: 1213, Message: "Deadlock found"})))
-	assert.True(t, isDeadlockError(errors.New("ERROR: deadlock detected; SQLSTATE 40P01")))
-	assert.True(t, isDeadlockError(errors.New("ERROR: lock not available; SQLSTATE 55P03")))
+	assert.True(t, isDeadlockError(&pgconn.PgError{Code: "40P01", Message: "deadlock detected"}))
+	assert.True(t, isDeadlockError(fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: "55P03", Message: "lock not available"})))
 	assert.False(t, isDeadlockError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}))
 	assert.False(t, isDeadlockError(errors.New("Error 1062 (23000): Duplicate entry for key 'alias_key'")))
 	assert.False(t, isDeadlockError(errors.New("connection reset by peer")))
@@ -961,6 +1077,36 @@ func TestIsDuplicateAliasError_WrappedPostgres23505(t *testing.T) {
 	}
 	wrapped := fmt.Errorf("claim alias %q for template %s fail: %w", "shared", "tpl-1", inner)
 	assert.True(t, isDuplicateAliasError(wrapped), "23505 must remain detectable after %%w wrap")
+}
+
+func TestIsDuplicateAliasErrorRejectsMisleadingText(t *testing.T) {
+	wrappedLengthError := fmt.Errorf(
+		"claim alias for template tpl-cache-claim-fail-23505 fail: %w",
+		&pgconn.PgError{Code: "22001", Message: "value too long"},
+	)
+	for _, err := range []error{
+		wrappedLengthError,
+		errors.New("claim alias for template tpl-cache-claim-fail-23505 failed: SQLSTATE 22001"),
+		errors.New("unique_constraint mentioned in diagnostic text"),
+		errors.New("ERROR: value too long for type character varying(256) (SQLSTATE 22001)"),
+	} {
+		assert.False(t, isDuplicateAliasError(err))
+	}
+}
+
+func TestIsDuplicateAliasErrorPostgresSQLState(t *testing.T) {
+	for _, code := range []string{"23505"} {
+		inner := &pgconn.PgError{Code: code, Message: "duplicate key"}
+		assert.True(t, isDuplicateAliasError(inner))
+		assert.True(t, isDuplicateAliasError(fmt.Errorf("wrapped: %w", inner)))
+	}
+	assert.False(t, isDuplicateAliasError(&pgconn.PgError{Code: "22001", Message: "value too long"}))
+}
+
+func TestIsDuplicateAliasErrorMySQLCodes(t *testing.T) {
+	assert.True(t, isDuplicateAliasError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}))
+	assert.True(t, isDuplicateAliasError(fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1062, Message: "Duplicate entry"})))
+	assert.False(t, isDuplicateAliasError(&mysql.MySQLError{Number: 1406, Message: "Data too long"}))
 }
 
 func TestSyncCreateRedoImageJobAliasTx_NoJobsSucceeds(t *testing.T) {

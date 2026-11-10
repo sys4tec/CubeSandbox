@@ -116,6 +116,20 @@ at the log"
 	exit 1
 }
 
+# Release a flusher hold left behind by an attach that got as far as publishing
+# the lvstore. An earlier attempt at this lived on the attach-RPC failure
+# branches, where it could do nothing: a failed RPC never reaches
+# lvs_setup_report(), so the lvstore is not in g_lvstores yet and
+# rcow_resume_flushers iterates an empty list -- and the bs_dev teardown that
+# does run there destroys the flusher anyway. The cases that need it are the
+# exits *after* a successful attach but before the resume at the end of this
+# script, where the hold is real and only the fallback timer would otherwise
+# clear it. Best effort: the caller is already on its way out.
+rcow_release_attach_hold()
+{
+	rcow_rpc rcow_resume_flushers '{}' >/dev/null 2>&1 || :
+}
+
 # ==========================================================================
 rcow_step "preflight"
 
@@ -125,6 +139,15 @@ rcow_need_cmd nvme "nvme-cli provides connect/disconnect (nvme-cli package)"
 if [ "${DO_CONNECT}" -eq 1 ]; then
 	rcow_need_nvme_tcp
 fi
+case "${RCOW_CACHE_HOT_BUFS}" in
+''|*[!0-9]*)
+	rcow_die "RCOW_CACHE_HOT_BUFS must be an integer from 0 to 8192"
+	;;
+*)
+	[ "${RCOW_CACHE_HOT_BUFS}" -le 8192 ] ||
+		rcow_die "RCOW_CACHE_HOT_BUFS must be at most 8192"
+	;;
+esac
 rcow_ensure_run_dir
 
 [ -x "${RCOW_TGT_BIN}" ] || rcow_die "target binary not found: ${RCOW_TGT_BIN}"
@@ -158,8 +181,14 @@ is not a state to recover from automatically"
 fi
 
 # Only now that nothing is running can these be assumed dead rather than in use.
+#
+# The hot-restart marker is removed here unconditionally. RCOW_RUN_DIR is not
+# tmpfs, so a marker can outlive the boot that wrote it, and a process that never
+# intended a hot restart must not honour one; the marker is the stop path's to
+# consume, and any stop that was going to consume it has already finished by the
+# time a start runs.
 rm -f "${RCOW_RPC_SOCK}" "${RCOW_RPC_SOCK}.lock" "/var/tmp/spdk_cpu_lock_"* \
-	"${RCOW_PIDFILE}"
+	"${RCOW_PIDFILE}" "${RCOW_HOT_MARKER}" "${RCOW_START_READY}"
 
 rcow_load_credentials ||
 	rcow_die "could not read access_key_id/secret_access_key from ${RCOW_S3_CFG}"
@@ -175,6 +204,8 @@ S3_BUCKETS="$(rcow_s3_buckets)"
 rcow_log "endpoint ${S3_ENDPOINT}, region ${S3_REGION}"
 rcow_log "buckets: $(printf '%s ' ${S3_BUCKETS})"
 rcow_log "lvstore '${RCOW_LVS_NAME}', WAL image ${RCOW_WAL_IMG}"
+rcow_preflight_writeback_shm ||
+	rcow_die "shared-memory write-back capacity preflight failed"
 
 # ==========================================================================
 rcow_step "starting the target"
@@ -226,14 +257,17 @@ printf '\n==== %s: starting %s\n' "$(date -Is)" "${RCOW_TGT_BIN}" >>"${RCOW_LOG}
 # options, and the pools are allocated during subsystem init. Passed separately
 # from TGT_ARGS so that overriding those cannot drop it.
 #
+# -r must match RCOW_RPC_SOCK: s3lvol_tgt defaults to /var/run/s3lvol.sock,
+# and rcow_wait_rpc below probes RCOW_RPC_SOCK -- a mismatch just times out.
+#
 # shellcheck disable=SC2086
 TGT_PID="$(rcow_start_target_detached "${RCOW_TGT_BIN}" -m "${RCOW_TGT_CPUMASK}" \
-	--wait-for-rpc ${TGT_ARGS})" ||
+	-r "${RCOW_RPC_SOCK}" --wait-for-rpc ${TGT_ARGS})" ||
 	bail "the target did not come up far enough to record its pid"
 
 rcow_wait_rpc 60 "${TGT_PID}" ||
 	bail "the target did not start answering RPCs within 60s"
-rcow_log "target up as pid ${TGT_PID}, log ${RCOW_LOG}"
+rcow_log "target up as pid ${TGT_PID}, mask ${RCOW_TGT_CPUMASK}, log ${RCOW_LOG}"
 
 rcow_apply_startup_opts || bail "the startup options could not be applied"
 
@@ -276,7 +310,18 @@ done
 # ==========================================================================
 rcow_step "lvstore '${RCOW_LVS_NAME}'"
 
-if BSTORE_ENTRY="$(rcow_bstore_entry "${RCOW_LVS_NAME}")"; then
+printf '%s\n' "${TGT_PID}" >"${RCOW_START_ATTACHED}.tmp" &&
+	mv -f "${RCOW_START_ATTACHED}.tmp" "${RCOW_START_ATTACHED}" ||
+	bail "could not record the create/attach attempt (${RCOW_START_ATTACHED})"
+
+BSTORE_STATUS=0
+BSTORE_ENTRY="$(rcow_bstore_entry "${RCOW_LVS_NAME}")" || BSTORE_STATUS=$?
+if [ "${BSTORE_STATUS}" -eq 3 ]; then
+	bail "${RCOW_BSTORE_FILE} is corrupt; refusing to guess whether \
+'${RCOW_LVS_NAME}' should be created or attached. Repair or restore the file"
+fi
+
+if [ "${BSTORE_STATUS}" -eq 0 ]; then
 	LVS_NS="${BSTORE_ENTRY%% *}"
 	LVS_WAL_RECORDED="${BSTORE_ENTRY##* }"
 
@@ -305,9 +350,10 @@ somewhere else, stop and check which image it meant"
 	rcow_log "found in ${RCOW_BSTORE_FILE} (namespace ${LVS_NS}): attaching, \
 which replays the journal and the WAL"
 
-	ATTACH_PARAMS="$(printf '{"lvs_name":"%s","namespace":"%s","wal_bdev":"%s","checkpoint_interval_sec":%s' \
+	ATTACH_PARAMS="$(printf '{"lvs_name":"%s","namespace":"%s","wal_bdev":"%s","checkpoint_interval_sec":%s,"cache_hot_bufs":%s,"writeback_size_mb":%s' \
 		"${RCOW_LVS_NAME}" "${LVS_NS}" "${RCOW_WAL_BDEV}" \
-		"${RCOW_CKPT_INTERVAL_SEC}")"
+		"${RCOW_CKPT_INTERVAL_SEC}" "${RCOW_CACHE_HOT_BUFS}" \
+		"${RCOW_WRITEBACK_MB}")"
 
 	LOG_MARK="$(rcow_log_size)"
 	if ! ATTACH_OUT="$(rcow_rpc rcow_attach_lvstore \
@@ -323,6 +369,9 @@ still in S3: ${OWNER_REASON}. Retrying with force=true"
 				"${ATTACH_PARAMS},\"force\":true}" 2>&1)" || {
 				rcow_err "rcow_attach_lvstore failed even with force: \
 ${ATTACH_OUT}"
+				# No release needed: the attach never published the lvstore,
+				# so there is no held flusher to reach and the bs_dev teardown
+				# already destroyed it.
 				bail "the lvstore could not be attached"
 			}
 		else
@@ -357,10 +406,11 @@ ${RCOW_BSTORE_FILE}"
 
 	# RCOW_CAPACITY_GB goes straight through: capacity_gib is in GiB, which is
 	# the unit this script always had. It used to multiply out to bytes here.
-	CREATE_PARAMS="$(printf '{"lvs_name":"%s","namespace":"%s","capacity_gib":%s,"wal_bdev":"%s","journal_size_mb":%s,"wal_size_mb":%s,"checkpoint_interval_sec":%s' \
+	CREATE_PARAMS="$(printf '{"lvs_name":"%s","namespace":"%s","capacity_gib":%s,"wal_bdev":"%s","journal_size_mb":%s,"wal_size_mb":%s,"checkpoint_interval_sec":%s,"cache_hot_bufs":%s,"writeback_size_mb":%s' \
 		"${RCOW_LVS_NAME}" "${LVS_NS}" "${RCOW_CAPACITY_GB}" \
 		"${RCOW_WAL_BDEV}" "${RCOW_JOURNAL_MB}" "${RCOW_WAL_MB}" \
-		"${RCOW_CKPT_INTERVAL_SEC}")"
+		"${RCOW_CKPT_INTERVAL_SEC}" "${RCOW_CACHE_HOT_BUFS}" \
+		"${RCOW_WRITEBACK_MB}")"
 
 	# A create can hit the same marker: an earlier create that died after
 	# writing it left no bstore.json entry, so this path is reached again.
@@ -392,8 +442,9 @@ else
 	REPLAY_RC=0
 	if [ -s "${RCOW_ACTIVE_FILE}" ]; then
 		rcow_warn "${RCOW_ACTIVE_FILE} lists volumes that are not attached in \
-this process. Run rcow_recovery.sh, or the next activation of one of them will \
-be reported as already active while no namespace exists"
+this process, so they will be listed with no device path until something \
+attaches them. Run rcow_recovery.sh to have the layout checked, or activate a \
+volume to attach it at its recorded placement"
 	fi
 fi
 
@@ -402,7 +453,12 @@ fi
 # reachable -- see the step 7 note in the header, and rcow_add_listeners().
 rcow_step "NVMf: listeners on ${RCOW_LISTEN_ADDR}:${RCOW_LISTEN_PORT}"
 
-rcow_add_listeners || bail "the subsystems exist but none of them is reachable"
+rcow_add_listeners || {
+	# The lvstore is published and its flusher is still held; the release at
+	# the end of this script is never reached from here.
+	rcow_release_attach_hold
+	bail "the subsystems exist but none of them is reachable"
+}
 
 # ==========================================================================
 if [ "${DO_CONNECT}" -eq 1 ]; then
@@ -410,6 +466,10 @@ if [ "${DO_CONNECT}" -eq 1 ]; then
 	# Not fatal: a subsystem that failed to connect costs the volumes hashed
 	# to it, and the ones that did connect are still worth having up. The
 	# warning names which.
+	#
+	# The timeouts ride on these connect flags. rcow_tune_initiator_timeouts is
+	# deliberately not called here: it writes to controllers that already
+	# exist, and at fresh-start time that set is empty.
 	rcow_connect_all ||
 		rcow_warn "some subsystems did not connect; volumes that hash to \
 them will activate on the target but never appear on this host"
@@ -430,6 +490,12 @@ if [ "${DO_REPLAY}" -eq 1 ] && [ "${DO_CONNECT}" -eq 1 ]; then
 	rcow_tune_readahead
 fi
 
+# Attach holds WAL-replay uploads while namespaces and listeners are restored.
+# Release that hold on the actual recovery milestone instead of waiting for the
+# attach-side fallback timer. Failure is non-fatal: the fallback still fires.
+rcow_rpc rcow_resume_flushers '{}' >/dev/null 2>&1 ||
+	rcow_warn "could not resume background uploads; attach fallback will retry"
+
 # ==========================================================================
 rcow_step "up"
 
@@ -440,8 +506,19 @@ rcow_log "activate a volume:  rcow_rpc rcow_active_bdev '{\"device_name\":\"NAME
 rcow_log "find its device:    rcow_rpc rcow_get_bdev '{\"device_name\":\"NAME\"}'"
 
 if [ "${REPLAY_RC}" -ne 0 ]; then
+	# No release needed: rcow_resume_flushers has already run above, so the
+	# attach hold is gone by now. Only the listener failure is early enough to
+	# need one.
 	rcow_err "the data plane is up but the previous layout was not fully \
 restored; see the warnings above"
 	exit 1
 fi
+
+# The orchestrator waits on this, not on the process existing or the lvstore
+# being attached: both of those are true before the replay and the layout check
+# above. A start that exits 1 must not leave the previous run's file behind;
+# it was removed before this process was spawned.
+printf '%s\n' "${TGT_PID}" >"${RCOW_START_READY}.tmp" &&
+	mv -f "${RCOW_START_READY}.tmp" "${RCOW_START_READY}" ||
+	bail "could not record that the start finished (${RCOW_START_READY})"
 exit 0

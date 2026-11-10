@@ -106,12 +106,19 @@ esac
 # "mysql redis minio", then drop external/disabled ones so a conflicting
 # container is never launched.
 CUBE_EXTERNAL_MYSQL_HOST="${CUBE_EXTERNAL_MYSQL_HOST:-}"
+CUBE_EXTERNAL_POSTGRES_HOST="${CUBE_EXTERNAL_POSTGRES_HOST:-}"
+CUBE_DATABASE_DRIVER="${CUBE_DATABASE_DRIVER:-mysql}"
 CUBE_EXTERNAL_REDIS_HOST="${CUBE_EXTERNAL_REDIS_HOST:-}"
 CUBE_EXTERNAL_REDIS_MASTER_NAME="${CUBE_EXTERNAL_REDIS_MASTER_NAME:-}"
 CUBE_SANDBOX_MINIO_ENABLED="${CUBE_SANDBOX_MINIO_ENABLED:-1}"
+# Skip bundled MySQL only when an external DB host is configured.
+skip_local_mysql=0
+if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST}" || -n "${CUBE_EXTERNAL_POSTGRES_HOST}" ]]; then
+  skip_local_mysql=1
+fi
 minio_dropped=0
-if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST}" || -n "${CUBE_EXTERNAL_REDIS_HOST}" \
-    || -n "${CUBE_EXTERNAL_REDIS_MASTER_NAME}" || "${CUBE_SANDBOX_MINIO_ENABLED}" != "1" \
+if [[ "${skip_local_mysql}" -eq 1 || -n "${CUBE_EXTERNAL_REDIS_HOST}" \
+    || -n "${CUBE_EXTERNAL_REDIS_CLUSTER_NODES:-}" || -n "${CUBE_EXTERNAL_REDIS_MASTER_NAME}" || "${CUBE_SANDBOX_MINIO_ENABLED}" != "1" \
     || -z "${SUPPORT_SERVICES}" ]]; then
   requested_services="${SUPPORT_SERVICES:-mysql redis minio}"
   filtered_services=""
@@ -121,13 +128,17 @@ if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST}" || -n "${CUBE_EXTERNAL_REDIS_HOST}" \
   for svc in "${requested_services_arr[@]}"; do
     case "${svc}" in
       mysql)
-        if [[ -n "${CUBE_EXTERNAL_MYSQL_HOST}" ]]; then
-          log "using external MySQL (${CUBE_EXTERNAL_MYSQL_HOST}), skipping local mysql container"
+        if [[ "${skip_local_mysql}" -eq 1 ]]; then
+          if [[ -n "${CUBE_EXTERNAL_POSTGRES_HOST}" ]]; then
+            log "using external PostgreSQL (${CUBE_EXTERNAL_POSTGRES_HOST}), skipping local mysql container"
+          else
+            log "using external MySQL (${CUBE_EXTERNAL_MYSQL_HOST}), skipping local mysql container"
+          fi
           continue
         fi
         ;;
       redis)
-        if [[ -n "${CUBE_EXTERNAL_REDIS_HOST}" || -n "${CUBE_EXTERNAL_REDIS_MASTER_NAME}" ]]; then
+        if [[ -n "${CUBE_EXTERNAL_REDIS_CLUSTER_NODES:-}" || -n "${CUBE_EXTERNAL_REDIS_HOST}" || -n "${CUBE_EXTERNAL_REDIS_MASTER_NAME}" ]]; then
           if [[ -n "${CUBE_EXTERNAL_REDIS_MASTER_NAME}" ]]; then
             log "using external Redis Sentinel (${CUBE_EXTERNAL_REDIS_MASTER_NAME}), skipping local redis container"
           else

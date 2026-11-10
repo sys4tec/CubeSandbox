@@ -72,7 +72,7 @@ validate_runtime_commands() {
 patch_common_yaml_list() {
   local key="$1"
   local raw_values="$2"
-  [[ -n "${raw_values//[[:space:],;]/}" ]] || return 0
+  [[ "${key}" == "operator_allow_out" || -n "${raw_values//[[:space:],;]/}" ]] || return 0
 
   local tmp_file
   tmp_file="$(mktemp)"
@@ -87,7 +87,8 @@ patch_common_yaml_list() {
       }
     }
     function emit(indent,    i, item) {
-      print indent key ":"
+      if (key == "operator_allow_out" && value_count == 0) print indent key ": []"
+      else print indent key ":"
       for (i = 1; i <= value_count; i++) {
         item = values[i]
         gsub(/"/, "\\\"", item)
@@ -181,6 +182,7 @@ configure_sandbox_dns() {
       log "sandbox DNS follow-node options: ${CUBE_SANDBOX_DNS_OPTIONS:-<empty>}"
     fi
   fi
+  patch_common_yaml_list operator_allow_out "${CUBE_SANDBOX_OPERATOR_ALLOW_OUT:-}"
   patch_common_yaml_list default_dns_servers "${CUBE_SANDBOX_DNS_SERVERS:-}"
   patch_common_yaml_list default_dns_searches "${CUBE_SANDBOX_DNS_SEARCHES:-}"
   patch_common_yaml_list default_dns_options "${CUBE_SANDBOX_DNS_OPTIONS:-}"
@@ -208,6 +210,18 @@ CUBE_OPS_ESC="$(sed_escape_replacement "${CUBE_OPS_ENDPOINT}")"
 CUBE_MASTER_HTTP_ESC="$(sed_escape_replacement "${CUBE_MASTER_HTTP_ADDR}")"
 sed -i -e "s#^\([[:space:]]*meta_server_endpoint:[[:space:]]*\).*#\1\"${CUBE_OPS_ESC}\"#" "${CUBELET_DYNAMICCONF}"
 sed -i -e "s#^\([[:space:]]*cubemaster_http_addr:[[:space:]]*\).*#\1\"${CUBE_MASTER_HTTP_ESC}\"#" "${CUBELET_DYNAMICCONF}"
+# Warehouse downloads use the same CubeOps as node register/heartbeat.
+# CUBE_OPS_ADDR overrides; otherwise http(s):// is added to CUBE_OPS_ENDPOINT.
+CUBELET_CUBEOPS_ADDR="${CUBE_OPS_ADDR:-${CUBE_OPS_ENDPOINT}}"
+if [[ "${CUBELET_CUBEOPS_ADDR}" != http://* && "${CUBELET_CUBEOPS_ADDR}" != https://* ]]; then
+  CUBELET_CUBEOPS_ADDR="http://${CUBELET_CUBEOPS_ADDR}"
+fi
+CUBE_OPS_ADDR_ESC="$(sed_escape_replacement "${CUBELET_CUBEOPS_ADDR}")"
+if grep -Eq '^[[:space:]]*cubeops_addr[[:space:]]*=' "${CUBELET_CONFIG}"; then
+  sed -i -e "s#^[[:space:]]*cubeops_addr[[:space:]]*=.*#    cubeops_addr = \"${CUBE_OPS_ADDR_ESC}\"#" "${CUBELET_CONFIG}"
+else
+  sed -i -e "/node_status_update_frequency/a\\    cubeops_addr = \"${CUBE_OPS_ADDR_ESC}\"" "${CUBELET_CONFIG}"
+fi
 configure_sandbox_dns
 
 if [[ -z "${CUBE_SANDBOX_ETH_NAME:-}" && "${CUBE_SANDBOX_AUTO_DETECT_ETH}" == "true" ]]; then

@@ -61,12 +61,30 @@ pub struct ReflinkConfig {
     /// Default: `/var/lib/cubecow/reflink`.
     #[serde(default = "default_reflink_root_dir")]
     pub root_dir: PathBuf,
+    /// How a snapshot or volume-from-snapshot copies its source file.
+    /// See [`CloneMethod`]. Default: `ficlone`.
+    #[serde(default)]
+    pub clone_method: CloneMethod,
+}
+
+/// File clone primitive used by the reflink backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneMethod {
+    /// `FICLONE` ioctl (xfs `reflink=1`, Btrfs, OCFS2).
+    #[default]
+    Ficlone,
+    /// `copy_file_range(2)` over the whole file. Only O(1) on
+    /// filesystems that implement it as a metadata clone (JuiceFS);
+    /// elsewhere it is a full in-kernel data copy.
+    CopyFileRange,
 }
 
 impl Default for ReflinkConfig {
     fn default() -> Self {
         Self {
             root_dir: default_reflink_root_dir(),
+            clone_method: CloneMethod::default(),
         }
     }
 }
@@ -92,6 +110,18 @@ pub struct S3Config {
     #[serde(default = "default_s3_rpc_timeout_ms")]
     pub rpc_timeout_ms: u64,
 
+    /// Total time budget, in milliseconds, that a single RPC may spend
+    /// retrying connection establishment before giving up. Default:
+    /// 60000.
+    ///
+    /// The socket is unlinked for the whole s3lvol hot-upgrade window, so
+    /// there a connect failure is the expected case rather than an error;
+    /// this budget decides how long control-plane calls block waiting for
+    /// the endpoint to return. Once a connection is up, a JSON-RPC error
+    /// response is an answer and is never retried.
+    #[serde(default = "default_s3_rpc_connect_budget_ms")]
+    pub rpc_connect_budget_ms: u64,
+
     /// How the `size_bytes → size_gib` conversion is handled at the
     /// boundary with s3lvol (which is GiB-granular): `"round_up"`
     /// (default) or `"strict"`.
@@ -105,6 +135,7 @@ impl Default for S3Config {
             socket_path: default_s3_socket_path(),
             state_dir: default_s3_state_dir(),
             rpc_timeout_ms: default_s3_rpc_timeout_ms(),
+            rpc_connect_budget_ms: default_s3_rpc_connect_budget_ms(),
             size_policy: default_s3_size_policy(),
         }
     }
@@ -118,6 +149,9 @@ fn default_s3_state_dir() -> PathBuf {
 }
 fn default_s3_rpc_timeout_ms() -> u64 {
     10_000
+}
+fn default_s3_rpc_connect_budget_ms() -> u64 {
+    60_000
 }
 fn default_s3_size_policy() -> String {
     "round_up".to_string()

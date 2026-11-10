@@ -58,7 +58,6 @@ type snapshotResource struct {
 	StorageBackend            string                      `json:"storage_backend,omitempty"`
 	Backend                   string                      `json:"backend,omitempty"`
 	RemoteStatus              string                      `json:"remote_status,omitempty"`
-	Retain                    bool                        `json:"retain,omitempty"`
 	RootfsSizeBytesAtSnapshot uint64                      `json:"rootfs_size_bytes_at_snapshot,omitempty"`
 	LastError                 string                      `json:"last_error,omitempty"`
 	CreatedAt                 string                      `json:"created_at,omitempty"`
@@ -135,7 +134,7 @@ var SnapshotCreateCommand = cli.Command{
 	Usage: "create a snapshot from an existing sandbox",
 	Flags: []cli.Flag{
 		cli.StringFlag{Name: "sandbox-id", Usage: "sandbox id to snapshot"},
-		cli.StringFlag{Name: "display-name", Usage: "snapshot display name"},
+		cli.StringFlag{Name: "display-name", Usage: "snapshot display name (must not start with tpl-/snap-)"},
 		cli.BoolFlag{Name: "json", Usage: "print raw json response"},
 	},
 	Action: func(c *cli.Context) error {

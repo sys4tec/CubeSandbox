@@ -10,12 +10,8 @@ cubesandbox,e2b, the [e2b] variants are skipped with an explanation.
 
 from __future__ import annotations
 
-import sys
 import time
 import uuid
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "sdk" / "python"))
 
 import pytest
 import requests
@@ -166,9 +162,14 @@ def test_template_build_preserves_advanced_create_options(
         containers = request.get("containers") or []
         assert len(containers) == 1, request
         container = containers[0]
-        assert container.get("envs") == [
-            {"key": "SDK_TEMPLATE_E2E", "value": "advanced"}
-        ], request
+        # Template env overrides are merged with ENV declared by the source
+        # image. Assert the requested override survives without assuming it is
+        # the complete container environment.
+        envs = {
+            env.get("key"): env.get("value")
+            for env in container.get("envs") or []
+        }
+        assert envs.get("SDK_TEMPLATE_E2E") == "advanced", request
         http_get = ((container.get("probe") or {}).get("probe_handler") or {}).get(
             "http_get"
         ) or {}

@@ -133,7 +133,7 @@ func TestEnsureCubeRunTemplateReturnsClone(t *testing.T) {
 		templatetypes.CubeComponentCubeShim: {Component: templatetypes.MachineComponent{Version: "v1"}},
 	})
 
-	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-clone")
+	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-clone", "xfs")
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestEnsureCubeRunTemplateHydratesCloneNotCache(t *testing.T) {
 		t.Fatalf("seed template: %v", err)
 	}
 
-	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-hydrate")
+	got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-hydrate", "xfs")
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestConcurrentEnsureMutatesClonesOnly(t *testing.T) {
 			defer done.Done()
 			start.Done()
 			start.Wait()
-			got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-race")
+			got, err := manager.EnsureCubeRunTemplate(context.Background(), "tpl-race", "xfs")
 			if err != nil {
 				t.Errorf("ensure: %v", err)
 				return
@@ -345,9 +345,105 @@ func TestRecoveredMetadataHomeAcceptsPausePackage(t *testing.T) {
 	}
 }
 
+func TestS3RecoveryIDsListsPackageHomesWhenIDUnknown(t *testing.T) {
+	root := t.TempDir()
+	snapshots := filepath.Join(root, "snapshots")
+	pause := filepath.Join(root, "pause-snapshots")
+	for _, dir := range []string{
+		filepath.Join(snapshots, "tpl-b"),
+		filepath.Join(snapshots, "tpl-a"),
+		filepath.Join(snapshots, "tpl-tmp.tmp"),
+		filepath.Join(snapshots, "deadbeefdeadbeefdeadbeef"),
+		filepath.Join(pause, "tpl-b"),
+		filepath.Join(pause, "snap-pause-1"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(snapshots, "not-a-package"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	got := s3RecoveryIDs(context.Background(), "", []string{snapshots, pause, filepath.Join(root, "missing")})
+	want := []string{"snap-pause-1", "tpl-a", "tpl-b"}
+	if len(got) != len(want) {
+		t.Fatalf("ids=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ids=%v, want %v", got, want)
+		}
+	}
+
+	one := s3RecoveryIDs(context.Background(), " tpl-only ", []string{snapshots})
+	if len(one) != 1 || one[0] != "tpl-only" {
+		t.Fatalf("specific id=%v, want [tpl-only]", one)
+	}
+}
+
 // An unmounted or absent package must not blow up the recovery attempt; the
 // caller treats it as a plain miss.
 func TestMountS3PackageMetadataForRecoveryTolerAtesMissingPackage(t *testing.T) {
 	mountS3PackageMetadataForRecovery(context.Background(), "")
 	mountS3PackageMetadataForRecovery(context.Background(), "snap-does-not-exist")
+}
+
+// A backend lookup must stay inside that backend's registered package root.
+func TestEnsureCubeRunTemplateRecoveryIsolatesBackends(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		backend string
+		local   bool
+	}{
+		{name: "xfs_local", backend: "xfs", local: true},
+		{name: "xfs_missing", backend: "xfs"},
+		{name: "default_local", backend: "", local: true},
+		{name: "jfs_local", backend: "jfs", local: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := newReadyTemplateManager(t)
+			root := t.TempDir()
+			id := "tpl-backend-isolation-" + filepath.Base(root)
+			expectedBackend := tc.backend
+			if expectedBackend == "" {
+				expectedBackend = "xfs"
+			}
+			home := filepath.Join(root, "snapshots", id)
+			makeHome := func(home string) {
+				t.Helper()
+				path := metadataHomeConfigPath(home)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.local {
+				makeHome(home)
+			}
+			oldRoot := recoverySnapshotKindRoot
+			t.Cleanup(func() { recoverySnapshotKindRoot = oldRoot })
+			recoverySnapshotKindRoot = func(backend, kind string) string {
+				if backend != expectedBackend {
+					t.Fatalf("%s request accessed %s storage", expectedBackend, backend)
+				}
+				return filepath.Join(root, kind)
+			}
+			got, err := manager.EnsureCubeRunTemplate(context.Background(), id, tc.backend)
+			if !tc.local {
+				if err == nil || got != nil {
+					t.Fatalf("missing template: got=%v err=%v", got, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got == nil || got.Snapshot.Snapshot.Path != filepath.Join(home, storage.SnapshotMetadataDir) {
+					t.Fatalf("wrong recovered template: %+v", got)
+				}
+			}
+		})
+	}
 }

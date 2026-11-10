@@ -29,10 +29,29 @@ else
   systemctl stop cube-sandbox-control.target
 fi
 
-# CubeS3lvol (when enabled) is a Wants= member of the role target, so the
-# stop above pulls cube-sandbox-s3lvol.service down through its ExecStop
-# (cube-s3lvol-stop.sh: full teardown if the target is alive, target-side
-# cleanup only if it has crashed -- never disconnecting the NVMf initiator).
+# CubeS3lvol (when enabled) is a Wants= member of the role target, so starting
+# that target pulls it up. It is deliberately NOT PartOf= it (see the unit), so
+# the stop above does not reach it and it is asked for here: a stop of this
+# service is a full teardown -- disconnect, unload, SIGTERM -- and down.sh is
+# where that is wanted. An upgrade, which is not tearing anything down, stops it
+# on its own terms instead.
+if systemctl is-enabled cube-sandbox-s3lvol.service >/dev/null 2>&1; then
+  systemctl stop cube-sandbox-s3lvol.service
+fi
+
+# Stop optional observability systemd units if present on this node.
+for _obs_unit in \
+  cube-sandbox-otelcol.service \
+  cube-sandbox-grafana.service \
+  cube-sandbox-loki.service \
+  cube-sandbox-elasticsearch.service \
+  cube-sandbox-prometheus.service; do
+  if systemctl is-active --quiet "${_obs_unit}" 2>/dev/null ||
+     systemctl is-enabled "${_obs_unit}" >/dev/null 2>&1; then
+    systemctl stop "${_obs_unit}" 2>/dev/null || true
+  fi
+done
+
 # down.sh intentionally does NOT delete the s3lvol per-node state
 # (/data/cubelet/rcow/wal_bdev.img, lvstore/bstore metadata): the next
 # install/start attaches and replays it.

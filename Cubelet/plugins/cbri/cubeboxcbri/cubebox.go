@@ -19,9 +19,6 @@ import (
 	"github.com/containerd/plugin/registry"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
-	cubeimages "github.com/tencentcloud/CubeSandbox/Cubelet/api/services/images/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/internal/cbri"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/container/pmem"
@@ -34,7 +31,10 @@ import (
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
-	CubeLog "github.com/tencentcloud/CubeSandbox/cubelog"
+	CubeLog "github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
+	cubeimages "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/images/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -45,16 +45,22 @@ func init() {
 		Config: defaultConfig(),
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			config := ic.Config.(*cubeboxInstancePluginConfig)
+			// server.New publishes pmem paths before containerd initializes plugins;
+			// keep one startup-time snapshot for all cbri operations.
 			return &cubeboxInstancePlugin{
-				config: config,
+				config:           config,
+				artifactPaths:    pmem.CurrentPaths(),
+				versionedBaseDir: templatetypes.DefaultVersionedBaseDir,
 			}, nil
 		},
 	})
 }
 
 type cubeboxInstancePluginConfig struct {
-	BasePath         string `toml:"base_path,omitempty"`
-	ImageBasePath    string `toml:"image_base_path,omitempty"`
+	BasePath string `toml:"base_path,omitempty"`
+	// Deprecated: retained for decoding older configurations; ignored at runtime.
+	ImageBasePath string `toml:"image_base_path,omitempty"`
+	// Deprecated: retained for decoding older configurations; ignored at runtime.
 	KernelBasePath   string `toml:"kernel_base_path,omitempty"`
 	SnapShotBasePath string `toml:"snapshot_base_path,omitempty"`
 	instanceType     string
@@ -64,8 +70,6 @@ func defaultConfig() *cubeboxInstancePluginConfig {
 	cfg := &cubeboxInstancePluginConfig{
 		BasePath: "/usr/local/services/cubetoolbox",
 	}
-	cfg.ImageBasePath = filepath.Join(cfg.BasePath, "cubebox_os_image")
-	cfg.KernelBasePath = filepath.Join(cfg.BasePath, "cubebox_os_image")
 	cfg.SnapShotBasePath = filepath.Join(cfg.BasePath, "cube-snapshot")
 	cfg.instanceType = cubebox.InstanceType_cubebox.String()
 	return cfg
@@ -88,7 +92,11 @@ type snapshotPaths struct {
 }
 
 type cubeboxInstancePlugin struct {
-	config *cubeboxInstancePluginConfig
+	config        *cubeboxInstancePluginConfig
+	artifactPaths pmem.Paths
+	// versionedBaseDir is the component_versions inventory root used to map a
+	// snapshot's recorded versions to local artifact paths.
+	versionedBaseDir string
 }
 
 func (e *cubeboxInstancePlugin) PostCreateContainer(ctx context.Context, cb *cubeboxstore.CubeBox, container *cubeboxstore.Container) error {
@@ -151,7 +159,7 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 
 	appImageID := constants.GetAppImageID(ctx)
 	if appImageID == "" {
-		kernelPath = filepath.Join(e.config.BasePath, "cube-kernel-scf", "vmlinux")
+		kernelPath = e.artifactPaths.SharedKernelPath
 	} else {
 		if flowOpts.IsCreateSnapshot() {
 			if err := e.syncLatestKernelForImage(ctx, appImageID); err != nil {
@@ -159,7 +167,7 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 			}
 		}
 		kernelPath = e.getKernelFilePath(appImageID)
-		rootfs := filepath.Join(e.config.ImageBasePath, appImageID)
+		rootfs := filepath.Join(e.artifactPaths.ImageDir(e.config.instanceType), appImageID)
 		specOpts = append(specOpts, oci.WithRootFSPath(rootfs))
 		logEntry = logEntry.WithField("rootfs", rootfs)
 	}
@@ -179,7 +187,7 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 		}
 		specOpts = append(specOpts, oci.WithAnnotations(virtiofsAnnotations))
 
-	} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok {
+	} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok && flowOpts.WantsSnapshotRestore() {
 
 		var snapBasePath, snapSpecPath string
 
@@ -316,19 +324,51 @@ func (e *cubeboxInstancePlugin) CreateSandbox(ctx context.Context, flowOpts *wor
 				}
 				specOpts = append(specOpts, opts...)
 			}
-			opts, err := generateSandboxVirtiofsOpt(ctx, flowOpts, false)
+			opts, err := generateSandboxVirtiofsOpt(ctx, flowOpts, true)
 			if err != nil {
 				return nil, ret.Err(errorcode.ErrorCode_InvalidParamFormat, err.Error())
 			}
 			specOpts = append(specOpts, opts...)
 
 		}
+	} else if flowOpts.IsColdBootFromSnapshot() {
+		// Filesystem-only snapshot: boot a fresh guest from the snapshot
+		// rootfs with locally resolved guest artifacts.
+		templateID, _ := flowOpts.GetSnapshotTemplateID()
+		paths, err := e.resolveSnapshotPaths(templateID, snapshotRestoreRawPath(ctx, flowOpts), flowOpts.ReqInfo)
+		if err != nil {
+			return nil, ret.Err(errorcode.ErrorCode_AppSnapshotNotExist, err.Error())
+		}
+		kernelPath, imagePath, agentPath, err := e.resolveColdBootGuestArtifacts(flowOpts.LocalRunTemplate, paths.Spec)
+		if err != nil {
+			return nil, ret.Err(errorcode.ErrorCode_PreConditionFailed, err.Error())
+		}
+		annotations[constants.AnnotationsVMKernelPath] = kernelPath
+		annotations[constants.AnnotationsVMOSImagePath] = imagePath
+		annotations[constants.AnnotationsVMAgentPath] = agentPath
+		annotations[constants.AnnotationSnapshotDisable] = "true"
+		// The recovered rootfs still holds the source sandbox's writable layer;
+		// record it so later boots mount that directory.
+		layer, err := coldBootWritableLayer(paths.Spec)
+		if err != nil {
+			return nil, ret.Err(errorcode.ErrorCode_PreConditionFailed, err.Error())
+		}
+		flowOpts.SnapshotWritableLayer = layer
+
+		sandbox := cubeboxstore.GetCubeBox(ctx)
+		if sandbox != nil && sandbox.FirstContainer() != nil {
+			opts, err := generateSandboxVirtiofsOpt(ctx, flowOpts, false)
+			if err != nil {
+				return nil, ret.Err(errorcode.ErrorCode_InvalidParamFormat, err.Error())
+			}
+			specOpts = append(specOpts, opts...)
+		}
 	} else {
 
 		annotations[constants.AnnotationSnapshotDisable] = "true"
 		sandbox := cubeboxstore.GetCubeBox(ctx)
 		if sandbox != nil && sandbox.FirstContainer() != nil {
-			opts, err := generateSandboxVirtiofsOpt(ctx, flowOpts, true)
+			opts, err := generateSandboxVirtiofsOpt(ctx, flowOpts, false)
 			if err != nil {
 				return nil, ret.Err(errorcode.ErrorCode_InvalidParamFormat, err.Error())
 			}
@@ -358,7 +398,7 @@ func (e *cubeboxInstancePlugin) CreateContainer(ctx context.Context, cubeBox *cu
 	}
 	specOpts = append(specOpts, replaceDevMounts()...)
 	if constants.GetAppImageID(ctx) != "" {
-		specOpts = append(specOpts, oci.WithRootFSPath(filepath.Join(e.config.ImageBasePath, constants.GetAppImageID(ctx))))
+		specOpts = append(specOpts, oci.WithRootFSPath(filepath.Join(e.artifactPaths.ImageDir(e.config.instanceType), constants.GetAppImageID(ctx))))
 	}
 	flowOpts := workflow.GetCreateContext(ctx)
 	if flowOpts != nil {
@@ -367,7 +407,7 @@ func (e *cubeboxInstancePlugin) CreateContainer(ctx context.Context, cubeBox *cu
 
 				constants.AnnotationPropagationContainerMounts: virtiofs.GenPropagationContainerDirs(),
 			}))
-		} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok {
+		} else if templateID, ok := flowOpts.GetSnapshotTemplateID(); ok && flowOpts.WantsSnapshotRestore() {
 
 			snapshotContainerID := templateID
 			if innerIndex, ok := ctx.Value(constants.KCubeIndexContext).(string); ok {
@@ -483,19 +523,19 @@ func (e *cubeboxInstancePlugin) genPmemOpt(ctx context.Context, imageID string) 
 }
 
 func (e *cubeboxInstancePlugin) getImageFilePath(imageID string) string {
-	return filepath.Join(e.config.ImageBasePath, imageID, imageID+".ext4")
+	return e.artifactPaths.ImageFile(e.config.instanceType, imageID)
 }
 
 func (e *cubeboxInstancePlugin) syncLatestKernelForImage(ctx context.Context, imageID string) error {
 	return pmem.RefreshKernelFile(
 		ctx,
-		filepath.Join(e.config.BasePath, "cube-kernel-scf", "vmlinux"),
+		e.artifactPaths.SharedKernelPath,
 		e.getKernelFilePath(imageID),
 	)
 }
 
 func (e *cubeboxInstancePlugin) getKernelFilePath(imageID string) string {
-	return filepath.Join(e.config.KernelBasePath, imageID, imageID+".vm")
+	return e.artifactPaths.KernelFile(e.config.instanceType, imageID)
 }
 
 func (e *cubeboxInstancePlugin) getSnapShotFilePath(templateID string) string {
@@ -669,7 +709,7 @@ func mountRestoreMetadata(ctx context.Context, flowOpts *workflow.CreateContext,
 
 func pauseCatalogMetaDir(ctx context.Context, snapID, preferred string) string {
 	seen := map[string]struct{}{}
-	for _, backend := range []string{preferred, cow.BackendXFS, cow.BackendS3} {
+	for _, backend := range []string{preferred, cow.BackendXFS, cow.BackendS3, cow.BackendJFS} {
 		backend = strings.TrimSpace(backend)
 		if backend == "" {
 			continue
@@ -772,8 +812,19 @@ func snapshotRestoreMemoryVolURLFromStorageInfo(flowOpts *workflow.CreateContext
 	return strings.TrimSpace(info.RestoreMemoryVolURL)
 }
 
+// snapshotMetadata is the part of the shim-written metadata.json this package
+// reads. The version fields are the "<dir>/version" strings of the guest
+// artifacts the snapshot was captured from; the container id is the identity of
+// the writable overlay layer inside the captured rootfs.
 type snapshotMetadata struct {
+	KernelVersion          string `json:"kernel_version,omitempty"`
+	ImageVersion           string `json:"image_version,omitempty"`
+	AgentVersion           string `json:"agent_version,omitempty"`
 	AppSnapshotContainerID string `json:"app_snapshot_container_id,omitempty"`
+	// RootfsWritableLayer is the overlay upper directory ("disk/<id>") the
+	// captured rootfs was written to. Packages produced before this field
+	// existed only carry AppSnapshotContainerID.
+	RootfsWritableLayer string `json:"rootfs_writable_layer,omitempty"`
 }
 
 func snapshotRestoreContainerID(templateID, snapshotSpecPath string) string {

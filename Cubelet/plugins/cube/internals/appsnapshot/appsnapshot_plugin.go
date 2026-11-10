@@ -12,13 +12,13 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
-	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/errorcode/v1"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/controller/runtemplate"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/ret"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
+	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/errorcode/v1"
 )
 
 func init() {
@@ -56,6 +56,9 @@ func (l *appsnapshotCompleter) Create(ctx context.Context, opts *workflow.Create
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, "opts nil")
 	}
 
+	if workflow.ReuseFor(opts).Storage {
+		return nil
+	}
 	templateID, ok := opts.GetSnapshotTemplateID()
 	if !ok {
 		return nil
@@ -88,9 +91,9 @@ func (l *appsnapshotCompleter) Create(ctx context.Context, opts *workflow.Create
 		}
 	}
 
-	lrt, err := l.runtemplateManager.EnsureCubeRunTemplate(ctx, templateID)
+	lrt, err := l.runtemplateManager.EnsureCubeRunTemplate(ctx, templateID, ann[constants.MasterAnnotationStorageBackend])
 	if err != nil && fallbackID != "" && fallbackID != templateID {
-		fallback, fallbackErr := l.runtemplateManager.EnsureCubeRunTemplate(ctx, fallbackID)
+		fallback, fallbackErr := l.runtemplateManager.EnsureCubeRunTemplate(ctx, fallbackID, ann[constants.MasterAnnotationStorageBackend])
 		if fallbackErr == nil {
 			log.G(ctx).Infof("run template %s is not on this node; restoring from %s instead",
 				templateID, fallbackID)

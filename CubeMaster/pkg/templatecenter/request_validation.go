@@ -7,16 +7,17 @@ package templatecenter
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"regexp"
 	"sort"
 	"strings"
 
-	cubeboxv1 "github.com/tencentcloud/CubeSandbox/CubeMaster/api/services/cubebox/v1"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/qos"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/templatecenter/image"
+	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
 func resolveTemplateNodes(instanceType string, scope []string) ([]*node.Node, error) {
@@ -68,6 +69,25 @@ func resolveTemplateNodes(instanceType string, scope []string) ([]*node.Node, er
 	return selected, nil
 }
 
+// templateBuildTargets narrows the nodes a template is built on. A jfs
+// template lives on the JuiceFS volume every node mounts, so it is built on
+// one schedulable node and the others adopt that package on first use.
+func templateBuildTargets(backend string, nodes []*node.Node) []*node.Node {
+	if !constants.IsJFSBackend(backend) || len(nodes) <= 1 {
+		return nodes
+	}
+	candidates := make([]*node.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if n != nil && n.SchedulingAllowed() {
+			candidates = append(candidates, n)
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = nodes
+	}
+	return []*node.Node{candidates[rand.Intn(len(candidates))]}
+}
+
 func normalizeTemplateImageRequest(req *types.CreateTemplateFromImageReq) (*types.CreateTemplateFromImageReq, error) {
 	if req == nil {
 		return nil, errors.New("request is nil")
@@ -79,7 +99,7 @@ func normalizeTemplateImageRequest(req *types.CreateTemplateFromImageReq) (*type
 	if sourceImageRef == "" {
 		return nil, errors.New("source_image_ref is required")
 	}
-	if err := image.ValidateImageRef(sourceImageRef); err != nil {
+	if err := ValidateImageRef(sourceImageRef); err != nil {
 		return nil, fmt.Errorf("source_image_ref: %w", err)
 	}
 	if strings.TrimSpace(req.WritableLayerSize) == "" {
@@ -87,6 +107,12 @@ func normalizeTemplateImageRequest(req *types.CreateTemplateFromImageReq) (*type
 	}
 	cloned := *req
 	cloned.SourceImageRef = sourceImageRef
+	resources := templateResources(req)
+	resolvedQos, err := qos.ResolveTemplate(req.Qos, resources)
+	if err != nil {
+		return nil, err
+	}
+	cloned.Qos = resolvedQos
 	exposedPorts, err := normalizeTemplateExposedPorts(req.ExposedPorts)
 	if err != nil {
 		return nil, err
@@ -118,7 +144,23 @@ func normalizeTemplateImageRequest(req *types.CreateTemplateFromImageReq) (*type
 	if err := validateTemplateCubeNetworkConfig(cloned.CubeNetworkConfig); err != nil {
 		return nil, err
 	}
+	if err := validateTemplateContainerUser(cloned.ContainerOverrides); err != nil {
+		return nil, err
+	}
 	return &cloned, nil
+}
+
+func templateResources(req *types.CreateTemplateFromImageReq) qos.TemplateResources {
+	resources := qos.TemplateResources{CPU: defaultTemplateCPU, Memory: defaultTemplateMemory}
+	if req.ContainerOverrides != nil && req.ContainerOverrides.Resources != nil {
+		if req.ContainerOverrides.Resources.Cpu != "" {
+			resources.CPU = req.ContainerOverrides.Resources.Cpu
+		}
+		if req.ContainerOverrides.Resources.Mem != "" {
+			resources.Memory = req.ContainerOverrides.Resources.Mem
+		}
+	}
+	return resources
 }
 
 // aliasValidationRe matches the allowed alias charset: lowercase alphanumeric
@@ -143,6 +185,16 @@ func validateTemplateAlias(alias string) error {
 	}
 	if !aliasValidationRe.MatchString(alias) {
 		return fmt.Errorf("alias %q is invalid: must match ^[a-z0-9][a-z0-9-]{0,63}$ (lowercase alphanumeric and hyphens, max 64 chars)", alias)
+	}
+	return nil
+}
+
+// validateSnapshotName rejects snapshot names that start with the tpl-/snap-
+// ID prefixes, which would be indistinguishable from IDs on delete.
+func validateSnapshotName(name string) error {
+	name = strings.TrimSpace(name)
+	if strings.HasPrefix(name, "tpl-") || strings.HasPrefix(name, "snap-") {
+		return fmt.Errorf("%w: %q must not start with 'tpl-' or 'snap-'", ErrInvalidSnapshotName, name)
 	}
 	return nil
 }

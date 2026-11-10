@@ -8,15 +8,15 @@
  *   The core point is not "a few NULL checks"; the entry points are closed to out-of-tree code:
  *
  *   - Every built-in lvol RPC goes through vbdev_lvol_store_first() walking
- *     g_spdk_lvol_pairs (vbdev_lvol.c:20), which is a **static private list** --
+ *     g_spdk_lvol_pairs (vbdev_lvol.c), which is a **static private list** --
  *     no external API can insert entries into it.
  *   - _create_lvol_disk() starts with vbdev_get_lvs_bdev_by_lvs() and
  *     assert(false)s when the lookup fails (the struct lvol_store_bdev
- *     machinery at vbdev_lvol.c:202 requires a real spdk_bdev); our lvstore
+ *     machinery at vbdev_lvol.c requires a real spdk_bdev); our lvstore
  *     sits on s3_bs_dev, with no bdev underneath.
  *
  *   Conversely, nvmf only recognises a name in the global bdev registry
- *   (spdk_bdev_open_ext_v2, lib/nvmf/subsystem.c:2596). So this file's whole
+ *   (spdk_bdev_open_ext_v2, lib/nvmf/subsystem.c). So this file's whole
  *   reason for being is: **register lvols as bdevs, thereby getting the entire
  *   nvmf ecosystem for free.**
  *
@@ -156,34 +156,15 @@ s3lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 					  s3lvol_io_complete, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
-		/* Complete inline. Two independent reasons, both of which the
-		 * first version got wrong by calling spdk_blob_sync_md() here.
+		/* Writes complete only after their records are published in the
+		 * process-shared write-back ring. That ring is this device's
+		 * durability domain: it survives a target crash and hot upgrade,
+		 * but deliberately not a node reboot. Linux has already waited for
+		 * earlier writes before issuing FLUSH, so no further work is needed.
 		 *
-		 * 1. It is not allowed from this thread. sync_md is a metadata
-		 *    operation, and blobstore asserts every one of them runs on
-		 *    bs->md_thread (blob_verify_md_op, blobstore.c:89). A FLUSH
-		 *    arrives on whichever nvmf poll group owns the qpair, never
-		 *    on the lvstore's own thread, so the target aborted as soon
-		 *    as a host ran mkfs / mount:
-		 *      blob_verify_md_op: Assertion
-		 *      `spdk_get_thread() == blob->bs->md_thread' failed.
-		 *
-		 * 2. There is nothing left to make durable. Everything this
-		 *    bdev has acknowledged is already persistent:
-		 *      - on the WAL path a write is acknowledged only after its
-		 *        batch is durable on the local bdev (s3_wal.c commits
-		 *        write + flush as one unit);
-		 *      - writing straight to S3, a PUT is durable when it
-		 *        completes;
-		 *      - blob metadata for a newly allocated cluster is written
-		 *        out by blobstore itself (blob_insert_cluster_msg)
-		 *        before the write that triggered it is acknowledged.
-		 *    That is the same reasoning as s3_bs_dev_flush(): "FLUSH does not
-		 *    flush blobstore metadata".
-		 *
-		 * Getting data all the way to S3 is a separate, far more
-		 * expensive operation (checkpoint / drain), deliberately not
-		 * wired to fsync. */
+		 * FUA is handled the same way by the ordinary write completion
+		 * above. Full S3 drains remain explicit control-plane operations for
+		 * export, unload and graceful shutdown. */
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
@@ -199,7 +180,7 @@ s3lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 }
 
 /* Read-only-ness is expressed through here, with no extra flag (copying what
- * vbdev_lvol.c:842 does).
+ * vbdev_lvol.c does).
  *
  *   - `nvmf_subsystem_add_ns` has no read-only-like parameter (only nsid /
  *     nguid / eui64 / uuid / anagrpid / ptpl-file);
@@ -389,7 +370,10 @@ vbdev_s3lvol_bdev_register(struct spdk_lvol *lvol, const char *lvs_name)
 	bdev->uuid     = lvol->uuid;
 
 	bdev->required_alignment = 0;   /* no underlying bdev; the S3 path needs no alignment */
-	bdev->write_cache        = 0;
+	/* Ordinary writes may complete from the process-shared write-back ring.
+	 * Advertising a volatile cache preserves the host's ordering boundaries;
+	 * FLUSH/FUA complete at shm durability rather than forcing S3. */
+	bdev->write_cache        = 1;
 
 	/* Split I/O at cluster boundaries: an I/O within one cluster never
 	 * crosses a blob's extent, and so is never broken into multiple chunk

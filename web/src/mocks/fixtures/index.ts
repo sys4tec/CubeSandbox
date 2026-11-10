@@ -3,6 +3,7 @@
 
 import type { components } from '@/api/generated/schema';
 import type { TemplateCompatMatrix } from '@/api/client';
+import { resetWarehouseState } from './warehouse';
 
 type ClusterOverviewDto = components['schemas']['ClusterOverview'];
 type ListedSandboxDto = components['schemas']['ListedSandbox'];
@@ -237,6 +238,7 @@ export function resetMockState() {
   sandboxes = buildSandboxes();
   templates = buildTemplates();
   nodes = buildNodes();
+  resetWarehouseState();
 }
 
 export async function mockDelay() {
@@ -246,9 +248,10 @@ export async function mockDelay() {
 
 export function listSandboxes(filters: { state?: string | null; metadata?: string | null } = {}) {
   const { state, metadata } = filters;
+  const wanted = state ? state.split(',') : null;
   return clone(
     sandboxes.filter((sandbox) => {
-      if (state && sandbox.state !== state) return false;
+      if (wanted && !wanted.includes(sandbox.state)) return false;
       if (!metadata) return true;
       const pairs = new URLSearchParams(metadata);
       return Array.from(pairs.entries()).every(([key, value]) => sandbox.metadata?.[key] === value);
@@ -390,7 +393,7 @@ export function getTemplate(templateID: string): TemplateDetailDto | undefined {
         spec: 'cpu=2000m,mem=4096Mi',
         artifact_id: 'rfs-mock-edge-01',
         last_job_id: 'job-mock-edge-01',
-        compat_status: base.templateID === 'python-3.11-ai' ? 'STALE' : 'OK',
+        compat_status: 'OK',
         guest_image_version:
           base.templateID === 'python-3.11-ai'
             ? 'guest-image@2024.11.02'
@@ -420,9 +423,9 @@ export function getTemplate(templateID: string): TemplateDetailDto | undefined {
 export function getTemplateCompat(): TemplateCompatMatrix {
   return {
     summary: {
-      staleTemplates: 1,
-      staleReplicas: 1,
-      affectedNodes: 1,
+      staleTemplates: 0,
+      staleReplicas: 0,
+      affectedNodes: 0,
       missingReplicas: 1,
       unknownReplicas: 1,
     },
@@ -430,12 +433,12 @@ export function getTemplateCompat(): TemplateCompatMatrix {
       {
         templateID: 'python-3.11-ai',
         instanceType: 'standard',
-        overall: 'STALE',
+        overall: 'OK',
         nodes: [
           {
             nodeID: 'cube-edge-01',
             nodeIP: '10.0.2.11',
-            compatStatus: 'STALE',
+            compatStatus: 'OK',
             boundGuestImageVersion: 'guest-image@2024.11.02',
             currentGuestImageVersion: 'guest-image@2024.12.01',
             boundAgentVersion: 'cube-agent@0.1.7',
